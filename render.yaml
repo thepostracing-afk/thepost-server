@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: thepost-tips
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PUSH_API_KEY
+        value: thepost2026   # change this to something secret!
