@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-PUSH_API_KEY = os.environ.get("PUSH_API_KEY", "thepost2026")
+PUSH_API_KEY = "thepost2026"
 STORE_FILE   = "/tmp/thepost_store.json"   # persists across requests, lost on restart
 
 app = FastAPI(title="The Post Tips", docs_url=None, redoc_url=None)
