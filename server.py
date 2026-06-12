@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""The Post — Live Tips Server  v4"""
+"""The Post — Live Tips Server  v5 (persistent storage via Upstash Redis)"""
 
 import os, json, datetime, base64
+import requests
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 PUSH_API_KEY = os.environ.get("PUSH_API_KEY", "thepost2026")
-STORE_FILE   = "/tmp/thepost_store.json"
+
+# --- Upstash Redis REST config ---
+UPSTASH_URL   = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+STORE_KEY     = "thepost_store"
+
+DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "last_push": None, "push_count": 0}
 
 app = FastAPI(title="The Post", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -25,17 +32,37 @@ async def serve_icon():
 async def manifest():
     return JSONResponse({"name":"The Post","short_name":"The Post","description":"Racing Intelligence","start_url":"/","display":"standalone","background_color":"#0B0F14","theme_color":"#0B0F14","orientation":"portrait","icons":[{"src":"/icon.png","sizes":"512x512","type":"image/png"}]})
 
+# ---------------------------------------------------------------------------
+# Persistent storage via Upstash Redis REST API
+# ---------------------------------------------------------------------------
+
+def _headers():
+    return {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+
 def _load():
+    """Fetch the store JSON from Upstash. Falls back to defaults on any error."""
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return dict(DEFAULT_STORE)
     try:
-        if os.path.exists(STORE_FILE):
-            with open(STORE_FILE) as f: return json.load(f)
-    except: pass
-    return {"tips":[],"analyzer":[],"live":[],"last_push":None,"push_count":0}
+        r = requests.get(f"{UPSTASH_URL}/get/{STORE_KEY}", headers=_headers(), timeout=5)
+        r.raise_for_status()
+        result = r.json().get("result")
+        if result is None:
+            return dict(DEFAULT_STORE)
+        return json.loads(result)
+    except Exception:
+        return dict(DEFAULT_STORE)
 
 def _save(s):
+    """Write the store JSON to Upstash."""
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return
     try:
-        with open(STORE_FILE,"w") as f: json.dump(s,f)
-    except: pass
+        payload = json.dumps(s)
+        # Upstash REST SET: POST /set/<key> with raw value as body
+        requests.post(f"{UPSTASH_URL}/set/{STORE_KEY}", headers=_headers(), data=payload, timeout=5)
+    except Exception:
+        pass
 
 _store = _load()
 
@@ -53,19 +80,25 @@ async def push(request: Request, x_api_key: str = Header(default="")):
     return {"status":"ok","tips":len(_store["tips"]),"analyzer_races":len(_store["analyzer"]),"live_races":len(_store["live"])}
 
 @app.get("/api/tips")
-async def api_tips(): return JSONResponse(_store["tips"])
-@app.get("/api/analyzer")
-async def api_analyzer(): return JSONResponse(_store["analyzer"])
-@app.get("/api/status")
-async def api_status(): return {"last_push":_store["last_push"],"push_count":_store["push_count"],"tips":len(_store["tips"]),"analyzer_races":len(_store["analyzer"])}
+async def api_tips():
+    return JSONResponse(_load()["tips"])
 
-def _pushed_str():
-    try: return datetime.datetime.fromisoformat(_store["last_push"]).strftime("%d %b  %H:%M")
+@app.get("/api/analyzer")
+async def api_analyzer():
+    return JSONResponse(_load()["analyzer"])
+
+@app.get("/api/status")
+async def api_status():
+    s = _load()
+    return {"last_push":s["last_push"],"push_count":s["push_count"],"tips":len(s["tips"]),"analyzer_races":len(s["analyzer"])}
+
+def _pushed_str(store):
+    try: return datetime.datetime.fromisoformat(store["last_push"]).strftime("%d %b  %H:%M")
     except: return "Never"
 
-def _shell(page_id, body):
-    pushed = _pushed_str()
-    total  = len(_store["tips"])
+def _shell(page_id, body, store):
+    pushed = _pushed_str(store)
+    total  = len(store["tips"])
     share_btn = '<button class="sbtn" onclick="openShare()">&#x2197; Share</button>' if page_id=="tips" else ""
     return """<!DOCTYPE html>
 <html lang="en">
@@ -286,7 +319,8 @@ def _cards_js(tips_list, label, container_id):
 
 @app.get("/", response_class=HTMLResponse)
 async def tips_page():
-    tips  = _store["tips"]
+    store = _load()
+    tips  = store["tips"]
     back  = [t for t in tips if t["type"]=="BACK"]
     degen = [t for t in tips if t["type"]=="DEGEN"]
     lay   = [t for t in tips if t["type"]=="LAY"]
@@ -322,12 +356,13 @@ async def tips_page():
         f'<div class="section" id="tp" data-grp="tips">{_cards_js(place,"place","cards-container-p")}</div>'
         '</div>'
     )
-    return HTMLResponse(_shell("tips", body))
+    return HTMLResponse(_shell("tips", body, store))
 
 @app.get("/dash", response_class=HTMLResponse)
 async def dash_page():
-    tips     = _store["tips"]
-    analyzer = _store["analyzer"]
+    store    = _load()
+    tips     = store["tips"]
+    analyzer = store["analyzer"]
     back  = [t for t in tips if t["type"]=="BACK"]
     degen = [t for t in tips if t["type"]=="DEGEN"]
     lay   = [t for t in tips if t["type"]=="LAY"]
@@ -348,7 +383,7 @@ async def dash_page():
     t_races  = len(analyzer)
     t_run    = sum(len(r.get("horses",[])) for r in analyzer)
     vc = "var(--green)" if avg_val>0 else "var(--red)"
-    pushed   = _pushed_str()
+    pushed   = _pushed_str(store)
     body = (
         '<div class="content">'
         '<div class="summary" style="margin-bottom:10px;">'
@@ -368,16 +403,17 @@ async def dash_page():
         f'<div class="stat-card"><div class="stat-label">High RSI</div><div class="stat-value">{hi_rsi}</div><div class="stat-sub">{med_rsi} medium RSI</div></div>'
         '</div>'
         f'<div class="card" style="margin-bottom:9px;"><div class="stat-label" style="margin-bottom:8px;">Tracks Today</div><div style="font-size:13px;line-height:1.6;">{tracks}</div></div>'
-        f'<div class="card"><div class="stat-label" style="margin-bottom:8px;">Last Push</div><div style="font-size:14px;font-weight:600;">{pushed}</div><div style="font-size:11px;color:var(--t2);margin-top:3px;">Push #{_store["push_count"]}</div></div>'
+        f'<div class="card"><div class="stat-label" style="margin-bottom:8px;">Last Push</div><div style="font-size:14px;font-weight:600;">{pushed}</div><div style="font-size:11px;color:var(--t2);margin-top:3px;">Push #{store["push_count"]}</div></div>'
         '</div>'
     )
-    return HTMLResponse(_shell("dash", body))
+    return HTMLResponse(_shell("dash", body, store))
 
 @app.get("/analyzer", response_class=HTMLResponse)
 async def analyzer_page():
-    races = _store["analyzer"]
+    store = _load()
+    races = store["analyzer"]
     if not races:
-        return HTMLResponse(_shell("analyzer",'<div class="content"><p class="empty">No analyzer data yet</p></div>'))
+        return HTMLResponse(_shell("analyzer",'<div class="content"><p class="empty">No analyzer data yet</p></div>', store))
     blocks = ""
     for i, r in enumerate(races):
         rsi = float(r.get("rsi",0))
@@ -414,7 +450,7 @@ async def analyzer_page():
         '<button class="asort-btn sort-btn" onclick="sortAnalyzer(\'track\',this)">Track A-Z</button>'
         '</div>'
     )
-    return HTMLResponse(_shell("analyzer", sort_bar + f'<div class="content"><div id="races-container">{blocks}</div></div>'))
+    return HTMLResponse(_shell("analyzer", sort_bar + f'<div class="content"><div id="races-container">{blocks}</div></div>', store))
 
 if __name__ == "__main__":
     import uvicorn
