@@ -96,7 +96,7 @@ def _pushed_str(store):
     try: return datetime.datetime.fromisoformat(store["last_push"]).strftime("%d %b  %H:%M")
     except: return "Never"
 
-def _shell(page_id, body, store):
+def _shell(page_id, body, store, friend=False):
     pushed = _pushed_str(store)
     total  = len(store["tips"])
     share_btn = '<button class="sbtn" onclick="openShare()">&#x2197; Share</button>' if page_id=="tips" else ""
@@ -217,10 +217,12 @@ body{font-family:-apple-system,'Segoe UI',Arial,sans-serif;background:var(--bg);
   </div>
 </div>
 <nav class="navbar">
-  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
+""" + ("""  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/portal/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
+  <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/portal'"><span class="ni">&#x1F3AF;</span>Tips</button>
+""" if friend else """  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
   <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/'"><span class="ni">&#x1F3AF;</span>Tips</button>
   <button class="nbtn """ + ("active" if page_id=="analyzer" else "") + """ " onclick="location.href='/analyzer'"><span class="ni">&#x1F50D;</span>Analyzer</button>
-</nav>
+""") + """</nav>
 <script>
 var _sortKey='time',_sortDir=1,_activeContainer='cards-container';
 function tog(id){document.getElementById(id).classList.toggle('open');}
@@ -317,9 +319,7 @@ def _cards_js(tips_list, label, container_id):
     out += "</div>"
     return out
 
-@app.get("/", response_class=HTMLResponse)
-async def tips_page():
-    store = _load()
+def _tips_body(store):
     tips  = store["tips"]
     back  = [t for t in tips if t["type"]=="BACK"]
     degen = [t for t in tips if t["type"]=="DEGEN"]
@@ -335,7 +335,7 @@ async def tips_page():
         '<button class="sort-btn" onclick="sortBy(\'real_odds\',this)">Odds</button>'
         '</div>'
     )
-    body = (
+    return (
         '<div class="tabs">'
         f'<button class="tab active" data-tab="tips" onclick="switchTab(\'tb\',this,\'tips\');setContainer(\'tb\')">Back ({len(back)})</button>'
         f'<button class="tab" data-tab="tips" onclick="switchTab(\'td\',this,\'tips\');setContainer(\'td\')">Degen ({len(degen)})</button>'
@@ -356,11 +356,18 @@ async def tips_page():
         f'<div class="section" id="tp" data-grp="tips">{_cards_js(place,"place","cards-container-p")}</div>'
         '</div>'
     )
-    return HTMLResponse(_shell("tips", body, store))
 
-@app.get("/dash", response_class=HTMLResponse)
-async def dash_page():
-    store    = _load()
+@app.get("/", response_class=HTMLResponse)
+async def tips_page():
+    store = _load()
+    return HTMLResponse(_shell("tips", _tips_body(store), store))
+
+@app.get("/portal", response_class=HTMLResponse)
+async def portal_tips_page():
+    store = _load()
+    return HTMLResponse(_shell("tips", _tips_body(store), store, friend=True))
+
+def _dash_body(store):
     tips     = store["tips"]
     analyzer = store["analyzer"]
     back  = [t for t in tips if t["type"]=="BACK"]
@@ -384,7 +391,7 @@ async def dash_page():
     t_run    = sum(len(r.get("horses",[])) for r in analyzer)
     vc = "var(--green)" if avg_val>0 else "var(--red)"
     pushed   = _pushed_str(store)
-    body = (
+    return (
         '<div class="content">'
         '<div class="summary" style="margin-bottom:10px;">'
         f'<div class="sc"><div class="sn" style="color:var(--green)">{len(back)}</div><div class="sl2">Back</div></div>'
@@ -406,7 +413,16 @@ async def dash_page():
         f'<div class="card"><div class="stat-label" style="margin-bottom:8px;">Last Push</div><div style="font-size:14px;font-weight:600;">{pushed}</div><div style="font-size:11px;color:var(--t2);margin-top:3px;">Push #{store["push_count"]}</div></div>'
         '</div>'
     )
-    return HTMLResponse(_shell("dash", body, store))
+
+@app.get("/dash", response_class=HTMLResponse)
+async def dash_page():
+    store = _load()
+    return HTMLResponse(_shell("dash", _dash_body(store), store))
+
+@app.get("/portal/dash", response_class=HTMLResponse)
+async def portal_dash_page():
+    store = _load()
+    return HTMLResponse(_shell("dash", _dash_body(store), store, friend=True))
 
 @app.get("/analyzer", response_class=HTMLResponse)
 async def analyzer_page():
