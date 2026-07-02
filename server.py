@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """The Post — Live Tips Server  v5 (persistent storage via Upstash Redis)"""
 
-import os, json, datetime, base64
+import os, json, datetime, base64, hashlib
+from urllib.parse import quote
 import requests
 from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 PUSH_API_KEY = os.environ.get("PUSH_API_KEY", "thepost2026")
@@ -21,9 +22,82 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
 
+# ---------------------------------------------------------------------------
+# Silk images — single shared component used by both the Tips cards and the
+# Analyzer tables, so silks look and behave identically everywhere.
+# ---------------------------------------------------------------------------
+SILK_SIZE      = 28   # px — identical size used in every location (24–30px spec)
+SILK_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "silk_cache")
+os.makedirs(SILK_CACHE_DIR, exist_ok=True)
+_silk_mem_cache = {}   # sha1(url) -> (content_type, bytes) — hot in-process cache
+
+def _get_silk_url(d):
+    """Pull whatever silk URL field is present on a tip/horse dict, trying
+    every naming convention the desktop client might push (never generated,
+    never substituted — only ever the real asset's own URL)."""
+    return (
+        d.get("silk_url") or d.get("SilkURL")
+        or d.get("silk")     or d.get("Silk")
+        or d.get("silk_image_url") or ""
+    ).strip()
+
+def _silk_html(url, size=SILK_SIZE):
+    """Render the shared silk component. If no silk is available, render an
+    identically-sized blank slot instead — never a placeholder icon, never a
+    different image."""
+    if not url:
+        return f'<span class="silk-wrap" style="width:{size}px;height:{size}px;"></span>'
+    src = f"/silk?u={quote(url, safe='')}"
+    return (
+        f'<span class="silk-wrap" style="width:{size}px;height:{size}px;">'
+        f'<img class="silk-img" src="{src}" width="{size}" height="{size}" '
+        f'loading="lazy" decoding="async" alt="" '
+        f'onerror="this.style.visibility=\'hidden\'">'
+        f'</span>'
+    )
+
+@app.get("/silk")
+async def silk_proxy(u: str = ""):
+    """Fetch-once, cache-forever proxy for a horse's real silk image. Serves
+    from an in-memory cache first, then an on-disk cache, and only ever
+    downloads a given silk URL once. Never generates or substitutes an image —
+    if the fetch fails, the caller gets a 404 and the front-end leaves the
+    slot blank."""
+    if not u:
+        raise HTTPException(status_code=404, detail="no silk")
+    key = hashlib.sha1(u.encode("utf-8")).hexdigest()
+
+    if key in _silk_mem_cache:
+        ctype, data = _silk_mem_cache[key]
+        return Response(data, media_type=ctype, headers={"Cache-Control": "public, max-age=604800, immutable"})
+
+    ext = ".svg" if u.lower().split("?")[0].endswith(".svg") else ".img"
+    disk_path = os.path.join(SILK_CACHE_DIR, key + ext)
+
+    if os.path.exists(disk_path):
+        with open(disk_path, "rb") as f:
+            data = f.read()
+        ctype = "image/svg+xml" if ext == ".svg" else "image/png"
+        _silk_mem_cache[key] = (ctype, data)
+        return Response(data, media_type=ctype, headers={"Cache-Control": "public, max-age=604800, immutable"})
+
+    try:
+        r = requests.get(u, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        data = r.content
+        ctype = r.headers.get("content-type", "").split(";")[0].strip()
+        if not ctype or "text/html" in ctype:
+            ctype = "image/svg+xml" if ext == ".svg" else "image/png"
+        with open(disk_path, "wb") as f:
+            f.write(data)
+        _silk_mem_cache[key] = (ctype, data)
+        return Response(data, media_type=ctype, headers={"Cache-Control": "public, max-age=604800, immutable"})
+    except Exception:
+        raise HTTPException(status_code=404, detail="silk unavailable")
+
 @app.get("/icon.png")
 async def serve_icon():
-    from fastapi.responses import FileResponse, Response
+    from fastapi.responses import FileResponse
     if os.path.exists(ICON_PATH):
         return FileResponse(ICON_PATH, media_type="image/png")
     return Response(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="), media_type="image/png")
@@ -142,7 +216,10 @@ body{font-family:-apple-system,'Segoe UI',Arial,sans-serif;background:var(--bg);
 .sort-btn.active{background:#1A2E4A;border-color:var(--acc);color:var(--acc);}
 .card{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:13px 14px;margin-bottom:9px;}
 .ctop{display:flex;align-items:center;justify-content:space-between;margin-bottom:3px;}
+.horse-row{display:inline-flex;align-items:center;gap:8px;min-width:0;}
 .horse{font-size:15px;font-weight:700;}
+.silk-wrap{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;border-radius:4px;overflow:hidden;background:transparent;vertical-align:middle;}
+.silk-img{width:100%;height:100%;object-fit:contain;display:block;image-rendering:auto;}
 .tag{font-size:10px;font-weight:700;padding:3px 8px;border-radius:20px;letter-spacing:.4px;text-transform:uppercase;}
 .tag.top-play{background:#1a3a1a;color:var(--green);}
 .tag.secondary{background:#1a2a4a;color:var(--acc);}
@@ -172,7 +249,8 @@ body{font-family:-apple-system,'Segoe UI',Arial,sans-serif;background:var(--bg);
 .rbody.open{display:block;}
 .tbl{width:100%;border-collapse:collapse;font-size:11px;}
 .tbl th{padding:7px 8px;text-align:left;color:var(--t2);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;background:var(--el);border-bottom:1px solid var(--bd);}
-.tbl td{padding:8px 8px;border-bottom:1px solid var(--bd);}
+.tbl td{padding:6px 8px;border-bottom:1px solid var(--bd);vertical-align:middle;}
+.tbl td.silk-cell{width:36px;padding:6px 4px 6px 8px;}
 .tbl tr:last-child td{border-bottom:none;}
 .tbl .top td:first-child{color:var(--warn);font-weight:700;}
 .vp{color:var(--green);font-weight:600;}.vn{color:var(--red);}
@@ -306,7 +384,7 @@ def _cards_js(tips_list, label, container_id):
             f' data-rsi="{t.get("rsi",0)}"'
             f' data-real_odds="{t.get("real_odds",0)}"'
             f' data-horse="{t.get("horse","")}">'
-            f'<div class="ctop"><span class="horse">{t.get("horse","")}</span>{tag_html}</div>'
+            f'<div class="ctop"><span class="horse-row">{_silk_html(_get_silk_url(t))}<span class="horse">{t.get("horse","")}</span></span>{tag_html}</div>'
             f'<div class="meta">{t.get("time","")} &middot; {t.get("track","")} &middot; {t.get("race","")}</div>'
             f'<div class="stats">'
             f'<div class="stat"><span class="sl">ODDS</span><span class="sv">${t.get("real_odds",0):.2f}</span></div>'
@@ -441,6 +519,7 @@ async def analyzer_page():
             top= "top" if j<3 else ""
             rows += (
                 f'<tr class="{top}">'
+                f'<td class="silk-cell">{_silk_html(_get_silk_url(h))}</td>'
                 f'<td>{h.get("horse","")}</td>'
                 f'<td class="ar">{h.get("win_pct",0):.1f}%</td>'
                 f'<td class="ar">${h.get("real_odds",0):.2f}</td>'
@@ -457,7 +536,7 @@ async def analyzer_page():
             f'<span class="rb {rc}">RSI {int(rsi)}</span>'
             '</div>'
             f'<div class="rbody" id="rb{i}">'
-            '<table class="tbl"><thead><tr><th>Horse</th><th>Win%</th><th>Odds</th><th>Fair</th><th>Val%</th><th>Jockey</th></tr></thead>'
+            '<table class="tbl"><thead><tr><th class="silk-cell"></th><th>Horse</th><th>Win%</th><th>Odds</th><th>Fair</th><th>Val%</th><th>Jockey</th></tr></thead>'
             f'<tbody>{rows}</tbody></table></div></div>'
         )
     sort_bar = (
