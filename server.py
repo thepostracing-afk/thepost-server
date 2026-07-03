@@ -166,6 +166,97 @@ async def api_status():
     s = _load()
     return {"last_push":s["last_push"],"push_count":s["push_count"],"tips":len(s["tips"]),"analyzer_races":len(s["analyzer"])}
 
+def _stat_row(label, value, suffix=""):
+    """One label/value chip for the horse stat rundown. Returns '' if there's
+    nothing worth showing, so the grid only ever displays real data."""
+    if value is None or value == "" :
+        return ""
+    try:
+        if float(value) == 0:
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return f'<div class="hstat"><span class="hsl">{label}</span><span class="hsv">{value}{suffix}</span></div>'
+
+def _fmt_pct(v):
+    try:
+        return f"{float(v):.1f}%"
+    except (TypeError, ValueError):
+        return ""
+
+def _fmt_odds(v):
+    try:
+        f = float(v)
+        return f"${f:.2f}" if f > 0 else ""
+    except (TypeError, ValueError):
+        return ""
+
+def _horse_detail_html(h):
+    """Full stat rundown for one horse — every field the desktop model tracks,
+    laid out as a compact grid. Missing/zero fields are simply omitted."""
+    starts_line = ""
+    cs, cw, cp = h.get("career_starts",""), h.get("career_wins",""), h.get("career_places","")
+    if cs not in ("", 0, None):
+        starts_line = f'<div class="hstat"><span class="hsl">CAREER</span><span class="hsv">{cw}-{cp} / {cs} starts</span></div>'
+
+    dist_line = ""
+    ds, dw, dp = h.get("distance_starts",""), h.get("distance_wins",""), h.get("distance_places","")
+    if ds not in ("", 0, None):
+        dist_line = f'<div class="hstat"><span class="hsl">DISTANCE</span><span class="hsv">{dw}-{dp} / {ds} starts</span></div>'
+
+    trk_line = ""
+    ts, tw, tp = h.get("track_starts",""), h.get("track_wins",""), h.get("track_places","")
+    if ts not in ("", 0, None):
+        trk_line = f'<div class="hstat"><span class="hsl">TRACK</span><span class="hsv">{tw}-{tp} / {ts} starts</span></div>'
+
+    cond_line = ""
+    cw2, cp2 = h.get("cond_wins",""), h.get("cond_places","")
+    if cw2 not in ("", 0, None) or cp2 not in ("", 0, None):
+        cond_line = f'<div class="hstat"><span class="hsl">TRACK COND</span><span class="hsv">{cw2}w-{cp2}p</span></div>'
+
+    recent_line = ""
+    rw, rp = h.get("recent_wins",""), h.get("recent_places","")
+    if rw not in ("", 0, None) or rp not in ("", 0, None):
+        recent_line = f'<div class="hstat"><span class="hsl">RECENT FORM</span><span class="hsv">{rw}w-{rp}p</span></div>'
+
+    chips = "".join([
+        _stat_row("TRAINER", h.get("trainer","")),
+        _stat_row("WEIGHT", h.get("weight",""), "kg"),
+        _stat_row("AGE", h.get("age","")),
+        _stat_row("JOCKEY SR", _fmt_pct(h.get("jockey_sr",""))),
+        _stat_row("TRAINER SR", _fmt_pct(h.get("trainer_sr",""))),
+        starts_line, dist_line, trk_line, cond_line, recent_line,
+        _stat_row("LAST 10", h.get("last10","")),
+        _stat_row("DAYS SINCE RUN", h.get("days_since_run","")),
+        _stat_row("SPELL", h.get("spell_days",""), " days"),
+        _stat_row("RUNS THIS PREP", h.get("runs_this_prep","")),
+        _stat_row("FIRST UP", "Yes" if h.get("first_up") else ""),
+        _stat_row("SECOND UP", "Yes" if h.get("second_up") else ""),
+        _stat_row("RUN STYLE", h.get("run_style","")),
+        _stat_row("EARLY SPEED", h.get("early_speed","")),
+        _stat_row("MAP SCORE", h.get("map_score","")),
+        _stat_row("OPENING ODDS", _fmt_odds(h.get("opening_odds",""))),
+        _stat_row("MID ODDS", _fmt_odds(h.get("mid_odds",""))),
+        _stat_row("CLOSING ODDS", _fmt_odds(h.get("closing_odds",""))),
+        _stat_row("MARKET DRIFT", _fmt_pct(h.get("market_drift",""))),
+        _stat_row("BLINKERS ON", "Yes" if h.get("blinkers_on") else ""),
+        _stat_row("BLINKERS OFF", "Yes" if h.get("blinkers_off") else ""),
+        _stat_row("TONGUE TIE", "Yes" if h.get("tongue_tie") else ""),
+        _stat_row("VISORS", "Yes" if h.get("visors") else ""),
+        _stat_row("GEAR CHANGE", "Yes" if h.get("first_gear") else ""),
+        _stat_row("LAST RATING", h.get("last_rating","")),
+        _stat_row("AVG RATING", h.get("avg_rating","")),
+        _stat_row("AVG MARGIN LOSS", h.get("avg_margin_loss","")),
+        _stat_row("SIRE WIN % DRY", _fmt_pct(h.get("sire_win_dry",""))),
+        _stat_row("SIRE WIN % WET", _fmt_pct(h.get("sire_win_wet",""))),
+        _stat_row("TRACK CONDITION", h.get("track_condition","")),
+    ])
+    notes = (h.get("stewards_notes","") or "").strip()
+    notes_html = f'<div class="hnotes"><span class="hsl">STEWARDS NOTES</span><p>{notes}</p></div>' if notes else ""
+    if not chips and not notes_html:
+        return '<div class="hstat-empty">No additional stats for this horse yet</div>'
+    return f'<div class="hstat-grid">{chips}</div>{notes_html}'
+
 def _pushed_str(store):
     try: return datetime.datetime.fromisoformat(store["last_push"]).strftime("%d %b  %H:%M")
     except: return "Never"
@@ -267,6 +358,19 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 .rm{background:#2a2210;color:var(--warn);}
 .rl{background:#2a1a1a;color:var(--red);}
 .empty{color:var(--t2);text-align:center;padding:34px 0;font-size:12.5px;}
+.horse-row-tr{cursor:pointer;}
+.hcaret{color:var(--t2);font-size:9px;margin-left:3px;display:inline-block;transition:transform .15s;}
+.horse-row-tr.open .hcaret{transform:rotate(180deg);color:var(--acc);}
+.hdetail-row{display:none;background:var(--bg);}
+.hdetail-row.open{display:table-row;}
+.hdetail-row td{padding:10px 10px 12px;border-bottom:1px solid var(--bd);white-space:normal;}
+.hstat-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;}
+.hstat{background:var(--el);border-radius:6px;padding:5px 8px;display:flex;flex-direction:column;gap:1px;min-width:0;}
+.hsl{font-size:8px;font-weight:700;color:var(--t2);letter-spacing:.4px;}
+.hsv{font-size:11.5px;font-weight:600;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.hstat-empty{color:var(--t2);font-size:11px;padding:6px 2px;}
+.hnotes{margin-top:8px;background:var(--el);border-radius:6px;padding:6px 8px;}
+.hnotes p{font-size:11px;color:var(--t1);line-height:1.4;margin-top:3px;}
 .modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;align-items:flex-end;justify-content:center;}
 .modal-bg.open{display:flex;}
 .modal{background:var(--panel);border-radius:16px 16px 0 0;padding:20px 16px 32px;width:100%;max-width:480px;}
@@ -310,6 +414,13 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 <script>
 var _sortKey='time',_sortDir=1,_activeContainer='cards-container';
 function tog(id){document.getElementById(id).classList.toggle('open');}
+function togHorse(id){
+  var row=document.getElementById(id);
+  if(!row) return;
+  var open=row.classList.toggle('open');
+  var trigger=row.previousElementSibling;
+  if(trigger) trigger.classList.toggle('open', open);
+}
 function openShare(){document.getElementById('share-modal').classList.add('open');}
 function closeShare(){document.getElementById('share-modal').classList.remove('open');}
 function buildShareText(){
@@ -523,15 +634,19 @@ async def analyzer_page():
             v  = float(h.get("value_pct",0))
             vc = "vp" if v>0 else ("vn" if v<0 else "")
             top= "top" if j<3 else ""
+            hid = f"h{i}_{j}"
             rows += (
-                f'<tr class="{top}">'
+                f'<tr class="{top} horse-row-tr" onclick="togHorse(\'{hid}\')">'
                 f'<td class="silk-cell">{_silk_html(_get_silk_url(h))}</td>'
-                f'<td>{h.get("horse","")}</td>'
+                f'<td>{h.get("horse","")} <span class="hcaret">&#x25BE;</span></td>'
                 f'<td class="ar">{h.get("win_pct",0):.1f}%</td>'
                 f'<td class="ar">${h.get("real_odds",0):.2f}</td>'
                 f'<td class="ar">${h.get("fair_odds",0):.2f}</td>'
                 f'<td class="ar {vc}">{v:+.1f}%</td>'
                 f'<td>{str(h.get("jockey",""))[:12]}</td>'
+                '</tr>'
+                f'<tr class="hdetail-row" id="{hid}">'
+                f'<td colspan="7">{_horse_detail_html(h)}</td>'
                 '</tr>'
             )
         blocks += (
