@@ -20,7 +20,7 @@ DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "last_push": None, "pus
 app = FastAPI(title="The Post", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-ICON_PATH = os.path.join(os.path.dirname(__file__), "icon.png")
+ICON_PATH = os.path.join(os.path.dirname(__file__), "thepost.png")
 
 # ---------------------------------------------------------------------------
 # Silk images — single shared component used by both the Tips cards and the
