@@ -505,6 +505,8 @@ function exportPhoto(){
   clone.classList.add('active');
 
   // Strip RSI + VALUE stat tiles from every card, then rebalance the grid.
+  // Silk images are kept — just forced to load eagerly so they're actually
+  // painted in by the time html2canvas rasterizes the page.
   clone.querySelectorAll('.card').forEach(function(card){
     card.querySelectorAll('.stat').forEach(function(s){
       var sl=s.querySelector('.sl');
@@ -513,10 +515,10 @@ function exportPhoto(){
     var grid=card.querySelector('.stats');
     if(grid) grid.style.gridTemplateColumns='repeat('+grid.children.length+',1fr)';
   });
-
-  var activeTabBtn=document.querySelector('.tab.active');
-  var tabLabel=activeTabBtn?activeTabBtn.textContent.replace(/\\s*\\(\\d+\\)\\s*$/,'').trim():'Tips';
-  var statusText=document.querySelector('.status')?document.querySelector('.status').textContent.trim():'';
+  clone.querySelectorAll('img').forEach(function(img){
+    img.removeAttribute('loading');
+    img.loading='eager';
+  });
 
   var stage=document.getElementById('export-stage');
   stage.innerHTML='';
@@ -528,22 +530,34 @@ function exportPhoto(){
   page.style.color='var(--t1)';
   page.style.fontSize='12.5px';
 
-  var header=document.createElement('div');
-  header.className='header';
-  header.style.position='static';
-  header.innerHTML=
-    '<div class="hrow"><div class="appname"><span class="dot"></span>The Post</div></div>'+
-    '<div class="status">'+statusText+' &middot; '+tabLabel+'</div>';
+  var logoWrap=document.createElement('div');
+  logoWrap.style.textAlign='center';
+  logoWrap.style.padding='20px 0 16px';
+  logoWrap.innerHTML='<img src="/icon.png" style="width:140px;height:auto;display:inline-block;">';
 
   var content=document.createElement('div');
   content.className='content';
   content.appendChild(clone);
 
-  page.appendChild(header);
+  page.appendChild(logoWrap);
   page.appendChild(content);
   stage.appendChild(page);
 
-  html2canvas(page,{backgroundColor:'#0B0F14',scale:2,useCORS:true}).then(function(canvas){
+  // Wait for every image (logo + silks) to actually finish loading — cloned
+  // <img> tags don't carry over the "already loaded" state, so capturing
+  // immediately would rasterize blank slots.
+  var imgs=[].slice.call(page.querySelectorAll('img'));
+  var imgsReady=Promise.all(imgs.map(function(img){
+    if(img.complete && img.naturalWidth>0) return Promise.resolve();
+    return new Promise(function(resolve){
+      img.onload=resolve;
+      img.onerror=resolve;
+    });
+  }));
+
+  imgsReady.then(function(){
+    return html2canvas(page,{backgroundColor:'#0B0F14',scale:2,useCORS:true});
+  }).then(function(canvas){
     stage.innerHTML='';
     toast.style.display='none';
     canvas.toBlob(function(blob){
