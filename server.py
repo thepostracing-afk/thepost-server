@@ -47,7 +47,12 @@ def _silk_html(url, size=SILK_SIZE):
     different image."""
     if not url:
         return f'<span class="silk-wrap" style="width:{size}px;height:{size}px;"></span>'
-    src = f"/silk?u={quote(url, safe='')}"
+    # The desktop app now embeds the silk directly as a base64 data: URI
+    # (it resolves the local silk file or CDN URL itself, so the browser
+    # never has to fetch anything). Only route through the /silk network
+    # proxy for a genuine remote URL — a data: URI can't be fetched by
+    # requests.get() and should just be used as-is.
+    src = url if url.startswith("data:") else f"/silk?u={quote(url, safe='')}"
     return (
         f'<span class="silk-wrap" style="width:{size}px;height:{size}px;">'
         f'<img class="silk-img" src="{src}" width="{size}" height="{size}" '
@@ -489,10 +494,44 @@ function sortAnalyzer(key,btn){
 
 // ---------------------------------------------------------------------------
 // Export Photo — renders the current tab's tips into an offscreen replica of
-// the tips page (same header, cards, styling) but with the RSI and VALUE
-// stats stripped out of each card, then rasterizes it to a PNG the user can
-// save or share.
+// the tips page (same cards, styling) but with the RSI and VALUE stats
+// stripped out of each card and the header swapped for the app logo, then
+// rasterizes it to a PNG the user can save or share.
 // ---------------------------------------------------------------------------
+var _logoCutoutCache=null;
+function _seamlessLogo(){
+  // The source /icon.png is a solid-black square with a white mark on it.
+  // Rather than paste that black square onto the app's dark-navy (--bg)
+  // background — which leaves a visible seam — key the black out into real
+  // transparency (alpha = luminance) so the mark just floats on whatever's
+  // behind it, seamlessly, regardless of the exact background colour.
+  if(_logoCutoutCache) return Promise.resolve(_logoCutoutCache);
+  return new Promise(function(resolve){
+    var img=new Image();
+    img.onload=function(){
+      try{
+        var c=document.createElement('canvas');
+        c.width=img.naturalWidth; c.height=img.naturalHeight;
+        var ctx=c.getContext('2d');
+        ctx.drawImage(img,0,0);
+        var frame=ctx.getImageData(0,0,c.width,c.height);
+        var d=frame.data;
+        for(var i=0;i<d.length;i+=4){
+          var lum=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+          d[i+3]=Math.round(lum*(d[i+3]/255));
+        }
+        ctx.putImageData(frame,0,0);
+        _logoCutoutCache=c.toDataURL('image/png');
+      }catch(e){
+        _logoCutoutCache='/icon.png';
+      }
+      resolve(_logoCutoutCache);
+    };
+    img.onerror=function(){ resolve('/icon.png'); };
+    img.src='/icon.png';
+  });
+}
+
 function exportPhoto(){
   if(typeof html2canvas==='undefined'){ alert('Export library failed to load — check your connection.'); return; }
   var activeSection=document.querySelector('.section.active');
@@ -532,31 +571,46 @@ function exportPhoto(){
 
   var logoWrap=document.createElement('div');
   logoWrap.style.textAlign='center';
-  logoWrap.style.padding='20px 0 16px';
-  logoWrap.innerHTML='<img src="/icon.png" style="width:140px;height:auto;display:inline-block;">';
+  logoWrap.style.padding='26px 0 18px';
+  var logoImg=document.createElement('img');
+  logoImg.style.cssText='width:132px;height:auto;display:inline-block;';
+  logoWrap.appendChild(logoImg);
+
+  var divider=document.createElement('div');
+  divider.style.cssText='height:1px;margin:0 20px 4px;background:linear-gradient(90deg,transparent,rgba(230,237,243,.16),transparent);';
 
   var content=document.createElement('div');
   content.className='content';
   content.appendChild(clone);
 
+  var footer=document.createElement('div');
+  footer.style.cssText='text-align:center;padding:6px 16px 24px;';
+  footer.innerHTML=
+    '<div style="height:1px;margin:4px 4px 12px;background:linear-gradient(90deg,transparent,rgba(230,237,243,.16),transparent);"></div>'+
+    '<div style="font-size:10px;letter-spacing:.4px;color:var(--t2);">The Post &middot; Racing Intelligence</div>';
+
   page.appendChild(logoWrap);
+  page.appendChild(divider);
   page.appendChild(content);
+  page.appendChild(footer);
   stage.appendChild(page);
 
-  // Wait for every image (logo + silks) to actually finish loading — cloned
-  // <img> tags don't carry over the "already loaded" state, so capturing
-  // immediately would rasterize blank slots.
-  var imgs=[].slice.call(page.querySelectorAll('img'));
-  var imgsReady=Promise.all(imgs.map(function(img){
-    if(img.complete && img.naturalWidth>0) return Promise.resolve();
-    return new Promise(function(resolve){
-      img.onload=resolve;
-      img.onerror=resolve;
-    });
-  }));
+  _seamlessLogo().then(function(logoSrc){
+    logoImg.src=logoSrc;
 
-  imgsReady.then(function(){
-    return html2canvas(page,{backgroundColor:'#0B0F14',scale:2,useCORS:true});
+    // Wait for every image (logo + silks) to actually finish loading —
+    // cloned <img> tags don't carry over the "already loaded" state, so
+    // capturing immediately would rasterize blank slots.
+    var imgs=[].slice.call(page.querySelectorAll('img'));
+    return Promise.all(imgs.map(function(img){
+      if(img.complete && img.naturalWidth>0) return Promise.resolve();
+      return new Promise(function(resolve){
+        img.onload=resolve;
+        img.onerror=resolve;
+      });
+    }));
+  }).then(function(){
+    return html2canvas(page,{backgroundColor:getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()||'#0B0F14',scale:2,useCORS:true});
   }).then(function(canvas){
     stage.innerHTML='';
     toast.style.display='none';
