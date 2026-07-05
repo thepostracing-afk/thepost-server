@@ -284,7 +284,7 @@ def _shell(page_id, body, store, friend=False):
 <link rel="apple-touch-icon" href="/icon.png">
 <link rel="shortcut icon" href="/icon.png">
 <title>The Post</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" defer></script>
 <style>
 :root{--bg:#0B0F14;--panel:#121821;--el:#1A222D;--bd:#232C38;--t1:#E6EDF3;--t2:#8B98A5;--green:#2ECC71;--red:#E74C3C;--acc:#3A82F7;--warn:#F0A500;}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
@@ -600,17 +600,31 @@ function exportPhoto(){
 
     // Wait for every image (logo + silks) to actually finish loading —
     // cloned <img> tags don't carry over the "already loaded" state, so
-    // capturing immediately would rasterize blank slots.
+    // capturing immediately would rasterize blank slots. Each image gets a
+    // hard 3s cap so one stuck/broken image can't stall the whole export.
     var imgs=[].slice.call(page.querySelectorAll('img'));
     return Promise.all(imgs.map(function(img){
       if(img.complete && img.naturalWidth>0) return Promise.resolve();
       return new Promise(function(resolve){
-        img.onload=resolve;
-        img.onerror=resolve;
+        var done=false;
+        var finish=function(){ if(!done){ done=true; resolve(); } };
+        img.onload=finish;
+        img.onerror=finish;
+        setTimeout(finish,3000);
       });
     }));
   }).then(function(){
-    return html2canvas(page,{backgroundColor:getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()||'#0B0F14',scale:2,useCORS:true});
+    // useCORS forces a fresh crossOrigin fetch even for images the browser
+    // already has cached (silks are inline data: URIs now anyway, and the
+    // logo/icon is same-origin) — dropping it avoids a redundant re-download
+    // that was the main thing making this slow. Lower scale + no console
+    // logging trims render time further.
+    return html2canvas(page,{
+      backgroundColor:getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()||'#0B0F14',
+      scale:1.5,
+      logging:false,
+      imageTimeout:4000
+    });
   }).then(function(canvas){
     stage.innerHTML='';
     toast.style.display='none';
