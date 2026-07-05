@@ -387,7 +387,7 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 .share-btn{background:var(--el);border:1px solid var(--bd);border-radius:10px;padding:14px 10px;text-align:center;cursor:pointer;color:var(--t1);font-size:12px;font-weight:600;text-decoration:none;display:block;}
 .share-icon{font-size:24px;display:block;margin-bottom:6px;}
 .modal-close{width:100%;margin-top:14px;padding:12px;background:var(--el);border:1px solid var(--bd);border-radius:10px;color:var(--t2);font-size:14px;cursor:pointer;}
-#export-stage{position:fixed;left:-9999px;top:0;width:390px;background:var(--bg);}
+#export-stage{position:fixed;top:0;left:0;width:390px;opacity:0;pointer-events:none;z-index:-1;background:var(--bg);}
 #export-toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:var(--panel);border:1px solid var(--bd);color:var(--t1);padding:10px 16px;border-radius:20px;font-size:12px;font-weight:600;z-index:300;display:none;box-shadow:0 4px 20px rgba(0,0,0,.4);}
 </style>
 </head>
@@ -499,6 +499,21 @@ function sortAnalyzer(key,btn){
 // rasterizes it to a PNG the user can save or share.
 // ---------------------------------------------------------------------------
 var _logoCutoutCache=null;
+function _isIOS(){
+  return /iP(hone|od|ad)/.test(navigator.userAgent) ||
+    (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
+}
+function _isCanvasBlank(canvas){
+  // Safari's foreignObject render path occasionally succeeds but paints
+  // nothing (a known WebKit quirk) rather than throwing — sample a spread
+  // of pixels' alpha channel to catch that case so we can fall back.
+  try{
+    var ctx=canvas.getContext('2d');
+    var d=ctx.getImageData(0,0,canvas.width,canvas.height).data;
+    for(var i=3;i<d.length;i+=811){ if(d[i]!==0) return false; }
+    return true;
+  }catch(e){ return false; }
+}
 function _seamlessLogo(){
   // The source /icon.png is a solid-black square with a white mark on it.
   // Rather than paste that black square onto the app's dark-navy (--bg)
@@ -595,7 +610,7 @@ function exportPhoto(){
   page.appendChild(footer);
   stage.appendChild(page);
 
-  _seamlessLogo().then(function(logoSrc){
+  var exportChain=_seamlessLogo().then(function(logoSrc){
     logoImg.src=logoSrc;
 
     // Wait for every image (logo + silks) to actually finish loading —
@@ -616,39 +631,68 @@ function exportPhoto(){
   }).then(function(){
     // useCORS forces a fresh crossOrigin fetch even for images the browser
     // already has cached (silks are inline data: URIs now anyway, and the
-    // logo/icon is same-origin) — dropping it avoids a redundant re-download
-    // that was the main thing making this slow. Lower scale + no console
-    // logging trims render time further.
-    return html2canvas(page,{
-      backgroundColor:getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()||'#0B0F14',
-      scale:1.5,
-      logging:false,
-      imageTimeout:4000
+    // logo/icon is same-origin) — dropping it avoids a redundant re-download.
+    //
+    // iOS Safari's canvas engine reconstructs every border-radius/box-shadow
+    // by hand in html2canvas's default renderer, which is dramatically
+    // slower than on Chrome/Android for card-heavy markup like this. Safari
+    // supports rendering via an SVG <foreignObject> instead, which lets
+    // WebKit's own (fast) native renderer do that work — so we try that
+    // first on iOS, with an automatic fallback to the default renderer if
+    // it comes back blank (a known occasional WebKit quirk).
+    var bg=getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()||'#0B0F14';
+    var iOS=_isIOS();
+    var baseOpts={backgroundColor:bg,logging:false,imageTimeout:4000,scale:iOS?1.25:1.5};
+    var foOpts=Object.assign({},baseOpts,{foreignObjectRendering:true});
+    var render=iOS ? html2canvas(page,foOpts) : html2canvas(page,baseOpts);
+    return render.then(function(canvas){
+      if(iOS && _isCanvasBlank(canvas)) return html2canvas(page,baseOpts);
+      return canvas;
+    }).catch(function(){
+      // foreignObjectRendering threw outright — standard renderer as fallback.
+      return html2canvas(page,baseOpts);
     });
   }).then(function(canvas){
+    return new Promise(function(resolve,reject){
+      canvas.toBlob(function(blob){
+        if(!blob){ reject(new Error('empty blob')); return; }
+        resolve(blob);
+      },'image/png');
+    });
+  });
+
+  // Hard ceiling on the whole process — if anything upstream (a stuck
+  // image, an html2canvas edge case) never resolves, this fires anyway so
+  // the user gets an error and their UI back instead of a frozen toast.
+  var watchdog=new Promise(function(_,reject){
+    setTimeout(function(){ reject(new Error('export-timeout')); },22000);
+  });
+
+  Promise.race([exportChain,watchdog]).then(function(blob){
     stage.innerHTML='';
     toast.style.display='none';
-    canvas.toBlob(function(blob){
-      if(!blob){ alert('Could not generate image.'); return; }
-      var fname='thepost-tips-'+Date.now()+'.png';
-      var file=new File([blob],fname,{type:'image/png'});
-      if(navigator.canShare && navigator.canShare({files:[file]})){
-        navigator.share({files:[file],title:'The Post Tips'}).catch(function(){});
-      } else {
-        var url=URL.createObjectURL(blob);
-        var link=document.createElement('a');
-        link.href=url;
-        link.download=fname;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        setTimeout(function(){URL.revokeObjectURL(url);},4000);
-      }
-    },'image/png');
-  }).catch(function(){
+    var fname='thepost-tips-'+Date.now()+'.png';
+    var file=new File([blob],fname,{type:'image/png'});
+    if(navigator.canShare && navigator.canShare({files:[file]})){
+      navigator.share({files:[file],title:'The Post Tips'}).catch(function(){});
+    } else {
+      var url=URL.createObjectURL(blob);
+      var link=document.createElement('a');
+      link.href=url;
+      link.download=fname;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(function(){URL.revokeObjectURL(url);},4000);
+    }
+  }).catch(function(err){
     stage.innerHTML='';
     toast.style.display='none';
-    alert('Export failed — please try again.');
+    if(err && err.message==='export-timeout'){
+      alert('Export took too long and was cancelled — please try again.');
+    } else {
+      alert('Export failed — please try again.');
+    }
   });
 }
 
