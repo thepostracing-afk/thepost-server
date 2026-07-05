@@ -265,6 +265,7 @@ def _shell(page_id, body, store, friend=False):
     pushed = _pushed_str(store)
     total  = len(store["tips"])
     share_btn = '<button class="sbtn" onclick="openShare()">&#x2197; Share</button>' if page_id=="tips" else ""
+    export_btn = '<button class="sbtn ebtn" onclick="exportPhoto()">&#x1F4F7; Export</button>' if page_id=="tips" else ""
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -278,6 +279,7 @@ def _shell(page_id, body, store, friend=False):
 <link rel="apple-touch-icon" href="/icon.png">
 <link rel="shortcut icon" href="/icon.png">
 <title>The Post</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <style>
 :root{--bg:#0B0F14;--panel:#121821;--el:#1A222D;--bd:#232C38;--t1:#E6EDF3;--t2:#8B98A5;--green:#2ECC71;--red:#E74C3C;--acc:#3A82F7;--warn:#F0A500;}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
@@ -297,6 +299,7 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 .hbtns{display:flex;align-items:center;gap:6px;flex-shrink:0;}
 .rbtn{background:var(--el);border:1px solid var(--bd);color:var(--t1);width:30px;height:30px;border-radius:8px;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1;}
 .sbtn{background:#1a3a1a;border:1px solid #2ECC71;color:#2ECC71;height:30px;padding:0 12px;border-radius:8px;font-size:11.5px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;white-space:nowrap;}
+.sbtn.ebtn{background:#1A2E4A;border:1px solid var(--acc);color:var(--acc);}
 .navbar{position:fixed;bottom:0;left:0;right:0;background:var(--panel);border-top:1px solid var(--bd);display:flex;z-index:100;padding-bottom:env(safe-area-inset-bottom);}
 .nbtn{flex:1;padding:9px 4px 8px;font-size:9.5px;color:var(--t2);background:none;border:none;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:2px;}
 .nbtn.active{color:var(--acc);}
@@ -379,13 +382,15 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 .share-btn{background:var(--el);border:1px solid var(--bd);border-radius:10px;padding:14px 10px;text-align:center;cursor:pointer;color:var(--t1);font-size:12px;font-weight:600;text-decoration:none;display:block;}
 .share-icon{font-size:24px;display:block;margin-bottom:6px;}
 .modal-close{width:100%;margin-top:14px;padding:12px;background:var(--el);border:1px solid var(--bd);border-radius:10px;color:var(--t2);font-size:14px;cursor:pointer;}
+#export-stage{position:fixed;left:-9999px;top:0;width:390px;background:var(--bg);}
+#export-toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:var(--panel);border:1px solid var(--bd);color:var(--t1);padding:10px 16px;border-radius:20px;font-size:12px;font-weight:600;z-index:300;display:none;box-shadow:0 4px 20px rgba(0,0,0,.4);}
 </style>
 </head>
 <body>
 <div class="header">
   <div class="hrow">
     <div class="appname"><span class="dot"></span>The Post</div>
-    <div class="hbtns">""" + share_btn + """
+    <div class="hbtns">""" + export_btn + share_btn + """
       <button class="rbtn" onclick="location.reload()">&#x21BB;</button>
     </div>
   </div>
@@ -404,6 +409,8 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
     <button class="modal-close" onclick="closeShare()">Cancel</button>
   </div>
 </div>
+<div id="export-toast">Generating photo&hellip;</div>
+<div id="export-stage"></div>
 <nav class="navbar">
 """ + ("""  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/portal/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
   <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/portal'"><span class="ni">&#x1F3AF;</span>Tips</button>
@@ -479,6 +486,90 @@ function sortAnalyzer(key,btn){
   blocks.sort(function(a,b){return (a.dataset[key]||'').localeCompare(b.dataset[key]||'');});
   blocks.forEach(function(b){c.appendChild(b);});
 }
+
+// ---------------------------------------------------------------------------
+// Export Photo — renders the current tab's tips into an offscreen replica of
+// the tips page (same header, cards, styling) but with the RSI and VALUE
+// stats stripped out of each card, then rasterizes it to a PNG the user can
+// save or share.
+// ---------------------------------------------------------------------------
+function exportPhoto(){
+  if(typeof html2canvas==='undefined'){ alert('Export library failed to load — check your connection.'); return; }
+  var activeSection=document.querySelector('.section.active');
+  if(!activeSection){ alert('Nothing to export yet.'); return; }
+
+  var toast=document.getElementById('export-toast');
+  toast.style.display='block';
+
+  var clone=activeSection.cloneNode(true);
+  clone.classList.add('active');
+
+  // Strip RSI + VALUE stat tiles from every card, then rebalance the grid.
+  clone.querySelectorAll('.card').forEach(function(card){
+    card.querySelectorAll('.stat').forEach(function(s){
+      var sl=s.querySelector('.sl');
+      if(sl && (sl.textContent==='RSI' || sl.textContent==='VALUE')) s.remove();
+    });
+    var grid=card.querySelector('.stats');
+    if(grid) grid.style.gridTemplateColumns='repeat('+grid.children.length+',1fr)';
+  });
+
+  var activeTabBtn=document.querySelector('.tab.active');
+  var tabLabel=activeTabBtn?activeTabBtn.textContent.replace(/\\s*\\(\\d+\\)\\s*$/,'').trim():'Tips';
+  var statusText=document.querySelector('.status')?document.querySelector('.status').textContent.trim():'';
+
+  var stage=document.getElementById('export-stage');
+  stage.innerHTML='';
+
+  var page=document.createElement('div');
+  page.style.width='390px';
+  page.style.background='var(--bg)';
+  page.style.fontFamily=getComputedStyle(document.body).fontFamily;
+  page.style.color='var(--t1)';
+  page.style.fontSize='12.5px';
+
+  var header=document.createElement('div');
+  header.className='header';
+  header.style.position='static';
+  header.innerHTML=
+    '<div class="hrow"><div class="appname"><span class="dot"></span>The Post</div></div>'+
+    '<div class="status">'+statusText+' &middot; '+tabLabel+'</div>';
+
+  var content=document.createElement('div');
+  content.className='content';
+  content.appendChild(clone);
+
+  page.appendChild(header);
+  page.appendChild(content);
+  stage.appendChild(page);
+
+  html2canvas(page,{backgroundColor:'#0B0F14',scale:2,useCORS:true}).then(function(canvas){
+    stage.innerHTML='';
+    toast.style.display='none';
+    canvas.toBlob(function(blob){
+      if(!blob){ alert('Could not generate image.'); return; }
+      var fname='thepost-tips-'+Date.now()+'.png';
+      var file=new File([blob],fname,{type:'image/png'});
+      if(navigator.canShare && navigator.canShare({files:[file]})){
+        navigator.share({files:[file],title:'The Post Tips'}).catch(function(){});
+      } else {
+        var url=URL.createObjectURL(blob);
+        var link=document.createElement('a');
+        link.href=url;
+        link.download=fname;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(function(){URL.revokeObjectURL(url);},4000);
+      }
+    },'image/png');
+  }).catch(function(){
+    stage.innerHTML='';
+    toast.style.display='none';
+    alert('Export failed — please try again.');
+  });
+}
+
 setTimeout(function(){location.reload();},90000);
 </script>
 </body></html>"""
