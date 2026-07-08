@@ -389,6 +389,14 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 .modal-close{width:100%;margin-top:14px;padding:12px;background:var(--el);border:1px solid var(--bd);border-radius:10px;color:var(--t2);font-size:14px;cursor:pointer;}
 #export-stage{position:fixed;top:0;left:0;width:390px;opacity:0;pointer-events:none;z-index:-1;background:var(--bg);}
 #export-toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:var(--panel);border:1px solid var(--bd);color:var(--t1);padding:10px 16px;border-radius:20px;font-size:12px;font-weight:600;z-index:300;display:none;box-shadow:0 4px 20px rgba(0,0,0,.4);}
+.video-frame{position:relative;width:100%;padding-top:56.25%;background:#000;border-radius:9px;overflow:hidden;border:1px solid var(--bd);}
+.video-frame iframe{position:absolute;top:0;left:0;width:100%;height:100%;border:0;}
+.watch-pane{display:none;}
+.watch-pane.active{display:block;}
+.watch-fallback{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px;padding:9px 11px;background:var(--panel);border:1px solid var(--bd);border-radius:8px;}
+.watch-fallback span{font-size:10.5px;color:var(--t2);}
+.wbtn{background:#1A2E4A;border:1px solid var(--acc);color:var(--acc);padding:7px 13px;border-radius:8px;font-size:11px;font-weight:700;text-decoration:none;white-space:nowrap;flex-shrink:0;}
+.watch-note{font-size:10.5px;color:var(--t2);line-height:1.5;padding:2px 2px 10px;}
 </style>
 </head>
 <body>
@@ -419,9 +427,11 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 <nav class="navbar">
 """ + ("""  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/portal/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
   <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/portal'"><span class="ni">&#x1F3AF;</span>Tips</button>
+  <button class="nbtn """ + ("active" if page_id=="watch" else "") + """ " onclick="location.href='/portal/watch'"><span class="ni">&#x1F4FA;</span>Watch</button>
 """ if friend else """  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
   <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/'"><span class="ni">&#x1F3AF;</span>Tips</button>
   <button class="nbtn """ + ("active" if page_id=="analyzer" else "") + """ " onclick="location.href='/analyzer'"><span class="ni">&#x1F50D;</span>Analyzer</button>
+  <button class="nbtn """ + ("active" if page_id=="watch" else "") + """ " onclick="location.href='/watch'"><span class="ni">&#x1F4FA;</span>Watch</button>
 """) + """</nav>
 <script>
 var _sortKey='time',_sortDir=1,_activeContainer='cards-container';
@@ -695,8 +705,7 @@ function exportPhoto(){
     }
   });
 }
-
-setTimeout(function(){location.reload();},90000);
+""" + ("" if page_id=="watch" else "setTimeout(function(){location.reload();},90000);") + """
 </script>
 </body></html>"""
 
@@ -884,6 +893,72 @@ async def analyzer_page():
         '</div>'
     )
     return HTMLResponse(_shell("analyzer", sort_bar + f'<div class="content"><div id="races-container">{blocks}</div></div>', store))
+
+# ---------------------------------------------------------------------------
+# Watch — embedded live-stream tab. Each source is the broadcaster's own
+# page loaded in an iframe so no video is ever extracted, re-hosted, or
+# proxied — this just puts their official player inside the app shell.
+# Update the URLs below if either broadcaster's live-vision widget moves to
+# a different page than its homepage.
+# ---------------------------------------------------------------------------
+STREAM_SOURCES = [
+    {"id": "racingcom", "label": "Racing.com", "url": "https://www.racing.com/"},
+    {"id": "racingnsw", "label": "RacingNSW",   "url": "https://www.racingnsw.com.au/"},
+]
+
+def _watch_body():
+    tabs_html = "".join(
+        f'<button class="tab{" active" if i==0 else ""}" data-tab="watch" '
+        f'onclick="switchWatch(\'{s["id"]}\',this)">{s["label"]}</button>'
+        for i, s in enumerate(STREAM_SOURCES)
+    )
+    panes_html = "".join(
+        f'''<div class="watch-pane{" active" if i==0 else ""}" id="watch-{s["id"]}">
+  <div class="video-frame">
+    <iframe src="{s["url"]}" loading="lazy" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen referrerpolicy="no-referrer-when-downgrade"></iframe>
+  </div>
+  <div class="watch-fallback">
+    <span>Player not loading here? Some sites block embedding.</span>
+    <a class="wbtn" href="{s["url"]}" target="_blank" rel="noopener">&#x2197; Open</a>
+  </div>
+</div>'''
+        for i, s in enumerate(STREAM_SOURCES)
+    )
+    ids_json = json.dumps([s["id"] for s in STREAM_SOURCES])
+    return f'''<div class="tabs">{tabs_html}</div>
+<div class="content">
+<div class="watch-note">Streams load the broadcaster's own site directly &mdash; if you're logged in / subscribed there in your regular browser, you may need to log in here too the first time.</div>
+{panes_html}
+</div>
+<script>
+var _watchIds={ids_json};
+function switchWatch(id,btn){{
+  document.querySelectorAll('[data-tab="watch"]').forEach(function(b){{b.classList.remove('active');}});
+  btn.classList.add('active');
+  document.querySelectorAll('.watch-pane').forEach(function(p){{p.classList.remove('active');}});
+  var pane=document.getElementById('watch-'+id);
+  if(pane) pane.classList.add('active');
+  try{{localStorage.setItem('thepost_watch_tab',id);}}catch(e){{}}
+}}
+(function(){{
+  var last=null;
+  try{{ last=localStorage.getItem('thepost_watch_tab'); }}catch(e){{}}
+  if(!last || _watchIds.indexOf(last)===-1) return;
+  var idx=_watchIds.indexOf(last);
+  var btns=document.querySelectorAll('[data-tab="watch"]');
+  if(btns[idx]) switchWatch(last,btns[idx]);
+}})();
+</script>'''
+
+@app.get("/watch", response_class=HTMLResponse)
+async def watch_page():
+    store = _load()
+    return HTMLResponse(_shell("watch", _watch_body(), store))
+
+@app.get("/portal/watch", response_class=HTMLResponse)
+async def portal_watch_page():
+    store = _load()
+    return HTMLResponse(_shell("watch", _watch_body(), store, friend=True))
 
 if __name__ == "__main__":
     import uvicorn
