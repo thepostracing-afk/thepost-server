@@ -952,10 +952,16 @@ function _parseRaceTime(str){
   var m=String(str).match(/(\\d{1,2}):(\\d{2})\\s*([AaPp][Mm])?/);
   if(!m) return null;
   var h=parseInt(m[1],10), mins=parseInt(m[2],10);
-  if(m[3]){
+    if(m[3]){
     var ap=m[3].toUpperCase();
     if(ap==='PM' && h<12) h+=12;
     if(ap==='AM' && h===12) h=0;
+  } else {
+    // Assume all race times before 1:00 are afternoon (e.g. 1:00 = 13:00+),
+    // but anything before 1:00 (11:30, 12:20, etc.) is always morning.
+    if(h >= 1 && h <= 10){
+      h += 12;
+    }
   }
   var now=new Date();
   var d=new Date(now.getFullYear(),now.getMonth(),now.getDate(),h,mins,0,0);
