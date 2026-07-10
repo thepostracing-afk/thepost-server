@@ -273,13 +273,29 @@ def _race_id(r):
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
 
 def _time_key(tstr):
-    """Numeric sort key for an 'H:MM'/'HH:MM' race time string, so 9:05 sorts
-    before 14:35 regardless of zero-padding."""
+    """Numeric sort key for race times.
+    Assumes:
+      - 11:xx and 12:xx are before 1 PM.
+      - 1:xx–10:xx are afternoon races (13:xx–22:xx) unless AM/PM is specified.
+    """
     try:
-        parts = str(tstr).strip().split(":")
-        h = float(parts[0])
-        m = float(parts[1][:2]) if len(parts) > 1 else 0.0
+        t = str(tstr).strip().upper()
+
+        if t.endswith("AM") or t.endswith("PM"):
+            dt = datetime.datetime.strptime(t, "%I:%M %p")
+            return dt.hour * 60 + dt.minute
+
+        parts = t.split(":")
+        h = int(parts[0])
+        m = int(parts[1][:2]) if len(parts) > 1 else 0
+
+        # Convert 1:00–10:59 to afternoon
+        if 1 <= h <= 10:
+            h += 12
+
+        # Leave 11:xx and 12:xx unchanged
         return h * 60 + m
+
     except Exception:
         return 99999.0
 
