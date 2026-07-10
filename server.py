@@ -266,6 +266,23 @@ def _pushed_str(store):
     try: return datetime.datetime.fromisoformat(store["last_push"]).strftime("%d %b  %H:%M")
     except: return "Never"
 
+def _race_id(r):
+    """Stable id for a race, independent of list ordering/sort, so links can
+    point at a specific race regardless of which sort is applied server-side."""
+    raw = f'{r.get("track","")}|{r.get("race","")}|{r.get("time","")}'
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+
+def _time_key(tstr):
+    """Numeric sort key for an 'H:MM'/'HH:MM' race time string, so 9:05 sorts
+    before 14:35 regardless of zero-padding."""
+    try:
+        parts = str(tstr).strip().split(":")
+        h = float(parts[0])
+        m = float(parts[1][:2]) if len(parts) > 1 else 0.0
+        return h * 60 + m
+    except Exception:
+        return 99999.0
+
 def _shell(page_id, body, store, friend=False):
     pushed = _pushed_str(store)
     total  = len(store["tips"])
@@ -337,6 +354,7 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 .pos{color:var(--green);}.neg{color:var(--red);}
 .summary{display:flex;gap:6px;margin-bottom:10px;}
 .sc{flex:1;background:var(--panel);border:1px solid var(--bd);border-radius:8px;padding:8px 4px;text-align:center;}
+.sc-link{cursor:pointer;}
 .sn{font-size:18px;font-weight:700;}.sl2{font-size:9px;color:var(--t2);text-transform:uppercase;letter-spacing:.4px;}
 .stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:10px;}
 .stat-card{background:var(--panel);border:1px solid var(--bd);border-radius:9px;padding:10px 11px;border-left:3px solid var(--acc);}
@@ -346,10 +364,19 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 .stat-label{font-size:9px;color:var(--t2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px;}
 .stat-value{font-size:18px;font-weight:700;}
 .stat-sub{font-size:10px;color:var(--t2);margin-top:2px;}
+.nr-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 2px;border-bottom:1px solid var(--bd);}
+.nr-row:last-child{border-bottom:none;}
+.nr-link{cursor:pointer;}
+.nr-name{font-size:11.5px;color:var(--t1);line-height:1.4;}
+.nr-arrow{color:var(--acc);font-size:14px;flex-shrink:0;}
 .rblock{background:var(--panel);border:1px solid var(--bd);border-radius:9px;margin-bottom:7px;overflow:hidden;}
 .rhdr{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px;cursor:pointer;}
 .rleft{font-size:12px;font-weight:700;}
 .rmeta{font-size:10px;color:var(--t2);margin-top:1px;}
+.rhdr-right{display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;}
+.cd{font-size:9.5px;font-weight:700;color:var(--t2);white-space:nowrap;}
+.cd.cd-orange{color:var(--warn);}
+.cd.cd-red{color:var(--red);}
 .rbody{display:none;border-top:1px solid var(--bd);overflow-x:auto;}
 .rbody.open{display:block;}
 .tbl{width:100%;border-collapse:collapse;font-size:10.5px;}
@@ -426,15 +453,13 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 <div id="export-stage"></div>
 <nav class="navbar">
 """ + ("""  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/portal/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
-  <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/portal'"><span class="ni">&#x1F3AF;</span>Tips</button>
   <button class="nbtn """ + ("active" if page_id=="watch" else "") + """ " onclick="location.href='/portal/watch'"><span class="ni">&#x1F4FA;</span>Watch</button>
 """ if friend else """  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
-  <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/'"><span class="ni">&#x1F3AF;</span>Tips</button>
   <button class="nbtn """ + ("active" if page_id=="analyzer" else "") + """ " onclick="location.href='/analyzer'"><span class="ni">&#x1F50D;</span>Analyzer</button>
   <button class="nbtn """ + ("active" if page_id=="watch" else "") + """ " onclick="location.href='/watch'"><span class="ni">&#x1F4FA;</span>Watch</button>
 """) + """</nav>
 <script>
-var _sortKey='time',_sortDir=1,_activeContainer='cards-container';
+var _sortKey='track',_sortDir=1,_activeContainer='cards-container';
 function tog(id){document.getElementById(id).classList.toggle('open');}
 function togHorse(id){
   var row=document.getElementById(id);
@@ -742,15 +767,15 @@ def _cards_js(tips_list, label, container_id):
 
 def _tips_body(store):
     tips  = store["tips"]
-    back  = [t for t in tips if t["type"]=="BACK"]
-    degen = [t for t in tips if t["type"]=="DEGEN"]
-    lay   = [t for t in tips if t["type"]=="LAY"]
-    place = [t for t in tips if t["type"]=="PLACE"]
+    back  = sorted([t for t in tips if t["type"]=="BACK"],  key=lambda t: t.get("track",""))
+    degen = sorted([t for t in tips if t["type"]=="DEGEN"], key=lambda t: t.get("track",""))
+    lay   = sorted([t for t in tips if t["type"]=="LAY"],   key=lambda t: t.get("track",""))
+    place = sorted([t for t in tips if t["type"]=="PLACE"], key=lambda t: t.get("track",""))
     sort_bar = (
         '<div class="sortbar">'
-        '<button class="sort-btn active" onclick="sortBy(\'time\',this)">&#x1F550; Time</button>'
+        '<button class="sort-btn" onclick="sortBy(\'time\',this)">&#x1F550; Time</button>'
         '<button class="sort-btn" onclick="sortBy(\'units\',this)">Units</button>'
-        '<button class="sort-btn" onclick="sortBy(\'track\',this)">Track</button>'
+        '<button class="sort-btn active" onclick="sortBy(\'track\',this)">Track</button>'
         '<button class="sort-btn" onclick="sortBy(\'win_pct\',this)">Win%</button>'
         '<button class="sort-btn" onclick="sortBy(\'rsi\',this)">RSI</button>'
         '<button class="sort-btn" onclick="sortBy(\'real_odds\',this)">Odds</button>'
@@ -758,10 +783,10 @@ def _tips_body(store):
     )
     return (
         '<div class="tabs">'
-        f'<button class="tab active" data-tab="tips" onclick="switchTab(\'tb\',this,\'tips\');setContainer(\'tb\')">Back ({len(back)})</button>'
-        f'<button class="tab" data-tab="tips" onclick="switchTab(\'td\',this,\'tips\');setContainer(\'td\')">Degen ({len(degen)})</button>'
-        f'<button class="tab" data-tab="tips" onclick="switchTab(\'tl\',this,\'tips\');setContainer(\'tl\')">Lay ({len(lay)})</button>'
-        f'<button class="tab" data-tab="tips" onclick="switchTab(\'tp\',this,\'tips\');setContainer(\'tp\')">Place ({len(place)})</button>'
+        f'<button id="btn-tb" class="tab active" data-tab="tips" onclick="switchTab(\'tb\',this,\'tips\');setContainer(\'tb\')">Back ({len(back)})</button>'
+        f'<button id="btn-td" class="tab" data-tab="tips" onclick="switchTab(\'td\',this,\'tips\');setContainer(\'td\')">Degen ({len(degen)})</button>'
+        f'<button id="btn-tl" class="tab" data-tab="tips" onclick="switchTab(\'tl\',this,\'tips\');setContainer(\'tl\')">Lay ({len(lay)})</button>'
+        f'<button id="btn-tp" class="tab" data-tab="tips" onclick="switchTab(\'tp\',this,\'tips\');setContainer(\'tp\')">Place ({len(place)})</button>'
         '</div>'
         + sort_bar +
         '<div class="content">'
@@ -776,6 +801,13 @@ def _tips_body(store):
         f'<div class="section" id="tl" data-grp="tips">{_cards_js(lay,"lay","cards-container-l")}</div>'
         f'<div class="section" id="tp" data-grp="tips">{_cards_js(place,"place","cards-container-p")}</div>'
         '</div>'
+        '<script>'
+        '(function(){'
+        'var params=new URLSearchParams(window.location.search);'
+        'var tab=params.get("tab");'
+        'if(tab){ var btn=document.getElementById("btn-"+tab); if(btn) btn.click(); }'
+        '})();'
+        '</script>'
     )
 
 @app.get("/", response_class=HTMLResponse)
@@ -788,7 +820,7 @@ async def portal_tips_page():
     store = _load()
     return HTMLResponse(_shell("tips", _tips_body(store), store, friend=True))
 
-def _dash_body(store):
+def _dash_body(store, friend=False):
     tips     = store["tips"]
     analyzer = store["analyzer"]
     back  = [t for t in tips if t["type"]=="BACK"]
@@ -798,38 +830,56 @@ def _dash_body(store):
     all_t = back+degen+lay+place
     total_u  = sum(t.get("units",0) for t in all_t)
     avg_odds = (sum(t.get("real_odds",0) for t in all_t)/len(all_t)) if all_t else 0
-    avg_rsi  = (sum(t.get("rsi",0) for t in all_t)/len(all_t)) if all_t else 0
-    avg_val  = (sum(t.get("value_pct",0) for t in all_t)/len(all_t)) if all_t else 0
     avg_win  = (sum(t.get("win_pct",0) for t in all_t)/len(all_t)) if all_t else 0
-    pos_val  = len([t for t in all_t if t.get("value_pct",0)>0])
-    neg_val  = len([t for t in all_t if t.get("value_pct",0)<0])
-    top_p    = len([t for t in all_t if t.get("tag")=="TOP PLAY"])
-    sec_p    = len([t for t in all_t if t.get("tag")=="SECONDARY"])
     tracks   = ", ".join(sorted({t.get("track","") for t in all_t if t.get("track")})) or "—"
-    hi_rsi   = len([r for r in analyzer if float(r.get("rsi",0))>=80])
-    med_rsi  = len([r for r in analyzer if 70<=float(r.get("rsi",0))<80])
     t_races  = len(analyzer)
     t_run    = sum(len(r.get("horses",[])) for r in analyzer)
-    vc = "var(--green)" if avg_val>0 else "var(--red)"
     pushed   = _pushed_str(store)
+
+    tips_base = "/portal" if friend else "/"
+
+    # Bet-type boxes are now the only route into Tips — clicking one jumps
+    # straight to that tab.
+    def _sc(tid, count, color, label):
+        return (
+            f'<div class="sc sc-link" onclick="location.href=\'{tips_base}?tab={tid}\'">'
+            f'<div class="sn" style="color:{color}">{count}</div><div class="sl2">{label}</div></div>'
+        )
+
+    # Next 5 races, soonest-first by scheduled time. For the owner, tapping a
+    # race jumps to its spot on the Analyzer page (friends don't have an
+    # Analyzer page, so their rows are static).
+    next_races = sorted(analyzer, key=lambda r: _time_key(r.get("time","")))[:5]
+    if next_races:
+        rows = ""
+        for r in next_races:
+            label = f'{r.get("time","")} &middot; {r.get("track","")} &middot; {r.get("race","")}'
+            if friend:
+                rows += f'<div class="nr-row"><span class="nr-name">{label}</span></div>'
+            else:
+                rid = _race_id(r)
+                rows += (
+                    f'<div class="nr-row nr-link" onclick="location.href=\'/analyzer#race-{rid}\'">'
+                    f'<span class="nr-name">{label}</span><span class="nr-arrow">&#x2192;</span></div>'
+                )
+        next_html = f'<div class="card" style="margin-bottom:9px;"><div class="stat-label" style="margin-bottom:8px;">Next 5 Races</div>{rows}</div>'
+    else:
+        next_html = ""
+
     return (
         '<div class="content">'
         '<div class="summary" style="margin-bottom:10px;">'
-        f'<div class="sc"><div class="sn" style="color:var(--green)">{len(back)}</div><div class="sl2">Back</div></div>'
-        f'<div class="sc"><div class="sn" style="color:var(--warn)">{len(degen)}</div><div class="sl2">Degen</div></div>'
-        f'<div class="sc"><div class="sn" style="color:var(--red)">{len(lay)}</div><div class="sl2">Lay</div></div>'
-        f'<div class="sc"><div class="sn" style="color:var(--acc)">{len(place)}</div><div class="sl2">Place</div></div>'
-        '</div>'
+        + _sc("tb", len(back),  "var(--green)", "Back")
+        + _sc("td", len(degen), "var(--warn)",  "Degen")
+        + _sc("tl", len(lay),   "var(--red)",   "Lay")
+        + _sc("tp", len(place), "var(--acc)",   "Place")
+        + '</div>'
         '<div class="stat-grid">'
         f'<div class="stat-card green"><div class="stat-label">Total Units</div><div class="stat-value">{total_u:.0f}u</div><div class="stat-sub">{len(all_t)} selections</div></div>'
-        f'<div class="stat-card" style="border-left-color:{vc}"><div class="stat-label">Avg Value</div><div class="stat-value" style="color:{vc}">{avg_val:+.1f}%</div><div class="stat-sub">{pos_val} pos &middot; {neg_val} neg</div></div>'
         f'<div class="stat-card warn"><div class="stat-label">Avg Odds</div><div class="stat-value">${avg_odds:.2f}</div><div class="stat-sub">Avg win {avg_win:.1f}%</div></div>'
-        f'<div class="stat-card"><div class="stat-label">Avg RSI</div><div class="stat-value">{avg_rsi:.0f}</div><div class="stat-sub">{top_p} TOP &middot; {sec_p} SEC</div></div>'
+        f'<div class="stat-card green" style="grid-column:1/-1;"><div class="stat-label">Races Loaded</div><div class="stat-value">{t_races}</div><div class="stat-sub">{t_run} runners</div></div>'
         '</div>'
-        '<div class="stat-grid">'
-        f'<div class="stat-card green"><div class="stat-label">Races Loaded</div><div class="stat-value">{t_races}</div><div class="stat-sub">{t_run} runners</div></div>'
-        f'<div class="stat-card"><div class="stat-label">High RSI</div><div class="stat-value">{hi_rsi}</div><div class="stat-sub">{med_rsi} medium RSI</div></div>'
-        '</div>'
+        + next_html +
         f'<div class="card" style="margin-bottom:9px;"><div class="stat-label" style="margin-bottom:8px;">Tracks Today</div><div style="font-size:13px;line-height:1.6;">{tracks}</div></div>'
         f'<div class="card"><div class="stat-label" style="margin-bottom:8px;">Last Push</div><div style="font-size:14px;font-weight:600;">{pushed}</div><div style="font-size:11px;color:var(--t2);margin-top:3px;">Push #{store["push_count"]}</div></div>'
         '</div>'
@@ -843,16 +893,17 @@ async def dash_page():
 @app.get("/portal/dash", response_class=HTMLResponse)
 async def portal_dash_page():
     store = _load()
-    return HTMLResponse(_shell("dash", _dash_body(store), store, friend=True))
+    return HTMLResponse(_shell("dash", _dash_body(store, friend=True), store, friend=True))
 
 @app.get("/analyzer", response_class=HTMLResponse)
 async def analyzer_page():
     store = _load()
-    races = store["analyzer"]
+    races = sorted(store["analyzer"], key=lambda r: r.get("track",""))
     if not races:
         return HTMLResponse(_shell("analyzer",'<div class="content"><p class="empty">No analyzer data yet</p></div>', store))
     blocks = ""
-    for i, r in enumerate(races):
+    for r in races:
+        rid = _race_id(r)
         rsi = float(r.get("rsi",0))
         rc  = "re" if rsi>=80 else ("rs" if rsi>=70 else ("rm" if rsi>=60 else "rl"))
         rows = ""
@@ -860,7 +911,7 @@ async def analyzer_page():
             v  = float(h.get("value_pct",0))
             vc = "vp" if v>0 else ("vn" if v<0 else "")
             top= "top" if j<3 else ""
-            hid = f"h{i}_{j}"
+            hid = f"h-{rid}-{j}"
             rows += (
                 f'<tr class="{top} horse-row-tr" onclick="togHorse(\'{hid}\')">'
                 f'<td class="silk-cell">{_silk_html(_get_silk_url(h))}</td>'
@@ -876,23 +927,77 @@ async def analyzer_page():
                 '</tr>'
             )
         blocks += (
-            f'<div class="rblock" data-time="{r.get("time","")}" data-track="{r.get("track","")}">'
-            f'<div class="rhdr" onclick="tog(\'rb{i}\')">'
+            f'<div class="rblock" id="race-{rid}" data-time="{r.get("time","")}" data-track="{r.get("track","")}">'
+            f'<div class="rhdr" onclick="tog(\'rb-{rid}\')">'
             f'<div><div class="rleft">{r.get("time","")} &middot; {r.get("track","")}</div>'
             f'<div class="rmeta">{r.get("race","")}</div></div>'
+            '<div class="rhdr-right">'
             f'<span class="rb {rc}">RSI {int(rsi)}</span>'
+            f'<span class="cd" data-time="{r.get("time","")}">&nbsp;</span>'
             '</div>'
-            f'<div class="rbody" id="rb{i}">'
+            '</div>'
+            f'<div class="rbody" id="rb-{rid}">'
             '<table class="tbl"><thead><tr><th class="silk-cell"></th><th>Horse</th><th>Win%</th><th>Odds</th><th>Fair</th><th>Val%</th><th>Jockey</th></tr></thead>'
             f'<tbody>{rows}</tbody></table></div></div>'
         )
     sort_bar = (
         '<div class="sortbar">'
-        '<button class="asort-btn sort-btn active" onclick="sortAnalyzer(\'time\',this)">&#x1F550; Time</button>'
-        '<button class="asort-btn sort-btn" onclick="sortAnalyzer(\'track\',this)">Track A-Z</button>'
+        '<button class="asort-btn sort-btn" onclick="sortAnalyzer(\'time\',this)">&#x1F550; Time</button>'
+        '<button class="asort-btn sort-btn active" onclick="sortAnalyzer(\'track\',this)">Track A-Z</button>'
         '</div>'
     )
-    return HTMLResponse(_shell("analyzer", sort_bar + f'<div class="content"><div id="races-container">{blocks}</div></div>', store))
+    countdown_script = '''<script>
+function _parseRaceTime(str){
+  if(!str) return null;
+  var m=String(str).match(/(\\d{1,2}):(\\d{2})\\s*([AaPp][Mm])?/);
+  if(!m) return null;
+  var h=parseInt(m[1],10), mins=parseInt(m[2],10);
+  if(m[3]){
+    var ap=m[3].toUpperCase();
+    if(ap==='PM' && h<12) h+=12;
+    if(ap==='AM' && h===12) h=0;
+  }
+  var now=new Date();
+  var d=new Date(now.getFullYear(),now.getMonth(),now.getDate(),h,mins,0,0);
+  var diff=d.getTime()-now.getTime();
+  if(diff < -6*3600*1000){ d.setDate(d.getDate()+1); diff=d.getTime()-now.getTime(); }
+  return diff;
+}
+function _fmtCountdown(ms){
+  if(ms<=0) return {text:'Started',cls:'cd-red'};
+  var mins=Math.round(ms/60000);
+  var h=Math.floor(mins/60), m=mins%60;
+  var text = h>0 ? (h+'h '+m+'m') : (m+'m');
+  var cls = mins<=10 ? 'cd-red' : (mins<=60 ? 'cd-orange' : '');
+  return {text:text,cls:cls};
+}
+function _tickCountdowns(){
+  document.querySelectorAll('.cd').forEach(function(el){
+    var t=el.getAttribute('data-time');
+    var diff=_parseRaceTime(t);
+    if(diff===null){ el.textContent=''; return; }
+    var r=_fmtCountdown(diff);
+    el.textContent=r.text;
+    el.classList.remove('cd-orange','cd-red');
+    if(r.cls) el.classList.add(r.cls);
+  });
+}
+_tickCountdowns();
+setInterval(_tickCountdowns, 15000);
+(function(){
+  var h=window.location.hash;
+  if(h && h.indexOf('#race-')===0){
+    var el=document.querySelector(h);
+    if(el){
+      var rid=h.slice(1).replace('race-','');
+      var body=document.getElementById('rb-'+rid);
+      if(body) body.classList.add('open');
+      setTimeout(function(){ el.scrollIntoView({behavior:'smooth',block:'start'}); }, 150);
+    }
+  }
+})();
+</script>'''
+    return HTMLResponse(_shell("analyzer", sort_bar + f'<div class="content"><div id="races-container">{blocks}</div></div>' + countdown_script, store))
 
 # ---------------------------------------------------------------------------
 # Watch — embedded live-stream tab. Each source is the broadcaster's own
