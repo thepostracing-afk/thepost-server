@@ -862,25 +862,72 @@ def _dash_body(store, friend=False):
             f'<div class="sn" style="color:{color}">{count}</div><div class="sl2">{label}</div></div>'
         )
 
-    # Next 5 races, soonest-first by scheduled time. For the owner, tapping a
-    # race jumps to its spot on the Analyzer page (friends don't have an
-    # Analyzer page, so their rows are static).
-    next_races = sorted(analyzer, key=lambda r: _time_key(r.get("time","")))[:5]
-    if next_races:
-        rows = ""
-        for r in next_races:
-            label = f'{r.get("time","")} &middot; {r.get("track","")} &middot; {r.get("race","")}'
-            if friend:
-                rows += f'<div class="nr-row"><span class="nr-name">{label}</span></div>'
-            else:
-                rid = _race_id(r)
-                rows += (
-                    f'<div class="nr-row nr-link" onclick="location.href=\'/analyzer#race-{rid}\'">'
-                    f'<span class="nr-name">{label}</span><span class="nr-arrow">&#x2192;</span></div>'
-                )
-        next_html = f'<div class="card" style="margin-bottom:9px;"><div class="stat-label" style="margin-bottom:8px;">Next 5 Races</div>{rows}</div>'
-    else:
-        next_html = ""
+    # Next 5 races — every race is rendered as a hidden template row tagged
+    # with its raw time string. Client-side JS reads the viewer's own local
+    # clock (same approach as the Analyzer countdown), drops any race whose
+    # start time has already passed, and shows only the soonest 5 that are
+    # still upcoming. It re-checks every 30s so races roll off the list live
+    # as the day goes on, without needing the page to reload.
+    all_sorted = sorted(analyzer, key=lambda r: _time_key(r.get("time","")))
+    tmpl_rows = ""
+    for r in all_sorted:
+        rid = _race_id(r)
+        label = f'{r.get("time","")} &middot; {r.get("track","")} &middot; {r.get("race","")}'
+        href = "" if friend else f"/analyzer#race-{rid}"
+        tmpl_rows += (
+            f'<div class="nr-tmpl" data-time="{r.get("time","")}" data-href="{href}">{label}</div>'
+        )
+    next_html = (
+        '<div class="card" style="margin-bottom:9px;">'
+        '<div class="stat-label" style="margin-bottom:8px;">Next 5 Races</div>'
+        '<div id="next-races-visible"><p class="empty" style="padding:14px 0;">Loading&hellip;</p></div>'
+        f'<div id="next-races-all" style="display:none;">{tmpl_rows}</div>'
+        '</div>'
+        '''<script>
+(function(){
+  function parseTime(str){
+    if(!str) return null;
+    var t=String(str).trim().toUpperCase();
+    var m=t.match(/(\\d{1,2}):(\\d{2})\\s*([AP]M)?/);
+    if(!m) return null;
+    var h=parseInt(m[1],10), mins=parseInt(m[2],10);
+    if(m[3]){
+      if(m[3]==='PM' && h<12) h+=12;
+      if(m[3]==='AM' && h===12) h=0;
+    } else if(h>=1 && h<=10){
+      h+=12;
+    }
+    var now=new Date();
+    var d=new Date(now.getFullYear(),now.getMonth(),now.getDate(),h,mins,0,0);
+    var diff=d.getTime()-now.getTime();
+    if(diff < -6*3600*1000){ d.setDate(d.getDate()+1); diff=d.getTime()-now.getTime(); }
+    return diff;
+  }
+  function refresh(){
+    var all=[].slice.call(document.querySelectorAll('#next-races-all .nr-tmpl'));
+    var upcoming=all.map(function(el){
+      return {diff:parseTime(el.getAttribute('data-time')), href:el.getAttribute('data-href'), label:el.innerHTML};
+    }).filter(function(r){ return r.diff!==null && r.diff>0; });
+    upcoming.sort(function(a,b){ return a.diff-b.diff; });
+    upcoming=upcoming.slice(0,5);
+    var vis=document.getElementById('next-races-visible');
+    if(!vis) return;
+    if(!upcoming.length){
+      vis.innerHTML='<p class="empty" style="padding:14px 0;">No more races today</p>';
+      return;
+    }
+    vis.innerHTML=upcoming.map(function(r){
+      if(r.href){
+        return '<div class="nr-row nr-link" onclick="location.href=\\''+r.href+'\\'"><span class="nr-name">'+r.label+'</span><span class="nr-arrow">&#x2192;</span></div>';
+      }
+      return '<div class="nr-row"><span class="nr-name">'+r.label+'</span></div>';
+    }).join('');
+  }
+  refresh();
+  setInterval(refresh, 30000);
+})();
+</script>'''
+    ) if all_sorted else ""
 
     return (
         '<div class="content">'
