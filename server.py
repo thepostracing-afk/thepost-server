@@ -539,7 +539,14 @@ function sortAnalyzer(key,btn){
   var c=document.getElementById('races-container');
   if(!c) return;
   var blocks=[].slice.call(c.querySelectorAll('.rblock'));
-  blocks.sort(function(a,b){return (a.dataset[key]||'').localeCompare(b.dataset[key]||'');});
+  blocks.sort(function(a,b){
+    if(key==='time'){
+      var at=parseFloat(a.dataset.timekey),bt=parseFloat(b.dataset.timekey);
+      if(isNaN(at)) at=99999; if(isNaN(bt)) bt=99999;
+      return at-bt;
+    }
+    return (a.dataset[key]||'').localeCompare(b.dataset[key]||'');
+  });
   blocks.forEach(function(b){c.appendChild(b);});
 }
 
@@ -961,7 +968,7 @@ async def portal_dash_page():
 @app.get("/analyzer", response_class=HTMLResponse)
 async def analyzer_page():
     store = _load()
-    races = sorted(store["analyzer"], key=lambda r: r.get("track",""))
+    races = sorted(store["analyzer"], key=lambda r: _time_key(r.get("time","")))
     if not races:
         return HTMLResponse(_shell("analyzer",'<div class="content"><p class="empty">No analyzer data yet</p></div>', store))
     blocks = ""
@@ -990,7 +997,7 @@ async def analyzer_page():
                 '</tr>'
             )
         blocks += (
-            f'<div class="rblock" id="race-{rid}" data-time="{r.get("time","")}" data-track="{r.get("track","")}">'
+            f'<div class="rblock" id="race-{rid}" data-time="{r.get("time","")}" data-timekey="{_time_key(r.get("time",""))}" data-track="{r.get("track","")}">'
             f'<div class="rhdr" onclick="tog(\'rb-{rid}\')">'
             f'<div><div class="rleft">{r.get("time","")} &middot; {r.get("track","")}</div>'
             f'<div class="rmeta">{r.get("race","")}</div></div>'
@@ -1005,8 +1012,8 @@ async def analyzer_page():
         )
     sort_bar = (
         '<div class="sortbar">'
-        '<button class="asort-btn sort-btn" onclick="sortAnalyzer(\'time\',this)">&#x1F550; Time</button>'
-        '<button class="asort-btn sort-btn active" onclick="sortAnalyzer(\'track\',this)">Track A-Z</button>'
+        '<button class="asort-btn sort-btn active" onclick="sortAnalyzer(\'time\',this)">&#x1F550; Time</button>'
+        '<button class="asort-btn sort-btn" onclick="sortAnalyzer(\'track\',this)">Track A-Z</button>'
         '</div>'
     )
     countdown_script = '''<script>
