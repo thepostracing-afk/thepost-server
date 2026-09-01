@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """The Post — Live Tips Server  v5 (persistent storage via Upstash Redis)"""
 
-import os, json, datetime, base64, hashlib
+import os, json, datetime, base64, hashlib, asyncio
+from collections import OrderedDict
 from urllib.parse import quote
 import requests
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from starlette.concurrency import run_in_threadpool
 
 PUSH_API_KEY = os.environ.get("PUSH_API_KEY", "thepost2026")
 
@@ -19,6 +22,9 @@ DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "last_push": None, "pus
 
 app = FastAPI(title="The Post", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# Compresses HTML/JSON responses in transit — meaningfully smaller payloads
+# on mobile data for basically no CPU cost at this traffic scale.
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 ICON_PATH = os.path.join(os.path.dirname(__file__), "thepost.png")
 
@@ -29,7 +35,14 @@ ICON_PATH = os.path.join(os.path.dirname(__file__), "thepost.png")
 SILK_SIZE      = 22   # px — identical size used in every location, tuned for the slimline mobile cards
 SILK_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "silk_cache")
 os.makedirs(SILK_CACHE_DIR, exist_ok=True)
-_silk_mem_cache = {}   # sha1(url) -> (content_type, bytes) — hot in-process cache
+SILK_MEM_CACHE_MAX = 500  # cap in-process entries so a long-running dyno can't grow this unbounded
+_silk_mem_cache = OrderedDict()   # sha1(url) -> (content_type, bytes) — hot in-process cache
+
+def _silk_mem_cache_put(key, value):
+    _silk_mem_cache[key] = value
+    _silk_mem_cache.move_to_end(key)
+    if len(_silk_mem_cache) > SILK_MEM_CACHE_MAX:
+        _silk_mem_cache.popitem(last=False)
 
 def _get_silk_url(d):
     """Pull whatever silk URL field is present on a tip/horse dict, trying
@@ -61,6 +74,28 @@ def _silk_html(url, size=SILK_SIZE):
         f'</span>'
     )
 
+def _fetch_silk_sync(u, disk_path, ext):
+    """All the blocking work for a cache-miss silk (disk read/write + the
+    remote HTTP fetch). Always called via run_in_threadpool so a slow or
+    stalled silk host blocks one worker thread, never the whole event loop —
+    previously this ran directly inside the async route, which meant every
+    other request on the server (tips, dashboard, API calls, other silks)
+    stalled behind it, sometimes for the full 5s timeout."""
+    if os.path.exists(disk_path):
+        with open(disk_path, "rb") as f:
+            data = f.read()
+        ctype = "image/svg+xml" if ext == ".svg" else "image/png"
+        return ctype, data
+    r = requests.get(u, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    data = r.content
+    ctype = r.headers.get("content-type", "").split(";")[0].strip()
+    if not ctype or "text/html" in ctype:
+        ctype = "image/svg+xml" if ext == ".svg" else "image/png"
+    with open(disk_path, "wb") as f:
+        f.write(data)
+    return ctype, data
+
 @app.get("/silk")
 async def silk_proxy(u: str = ""):
     """Fetch-once, cache-forever proxy for a horse's real silk image. Serves
@@ -72,30 +107,18 @@ async def silk_proxy(u: str = ""):
         raise HTTPException(status_code=404, detail="no silk")
     key = hashlib.sha1(u.encode("utf-8")).hexdigest()
 
-    if key in _silk_mem_cache:
-        ctype, data = _silk_mem_cache[key]
+    cached = _silk_mem_cache.get(key)
+    if cached is not None:
+        _silk_mem_cache.move_to_end(key)
+        ctype, data = cached
         return Response(data, media_type=ctype, headers={"Cache-Control": "public, max-age=604800, immutable"})
 
     ext = ".svg" if u.lower().split("?")[0].endswith(".svg") else ".img"
     disk_path = os.path.join(SILK_CACHE_DIR, key + ext)
 
-    if os.path.exists(disk_path):
-        with open(disk_path, "rb") as f:
-            data = f.read()
-        ctype = "image/svg+xml" if ext == ".svg" else "image/png"
-        _silk_mem_cache[key] = (ctype, data)
-        return Response(data, media_type=ctype, headers={"Cache-Control": "public, max-age=604800, immutable"})
-
     try:
-        r = requests.get(u, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        data = r.content
-        ctype = r.headers.get("content-type", "").split(";")[0].strip()
-        if not ctype or "text/html" in ctype:
-            ctype = "image/svg+xml" if ext == ".svg" else "image/png"
-        with open(disk_path, "wb") as f:
-            f.write(data)
-        _silk_mem_cache[key] = (ctype, data)
+        ctype, data = await run_in_threadpool(_fetch_silk_sync, u, disk_path, ext)
+        _silk_mem_cache_put(key, (ctype, data))
         return Response(data, media_type=ctype, headers={"Cache-Control": "public, max-age=604800, immutable"})
     except Exception:
         raise HTTPException(status_code=404, detail="silk unavailable")
@@ -143,33 +166,74 @@ def _save(s):
     except Exception:
         pass
 
+# _store is the single in-memory source of truth for every GET route below.
+# /push is the only writer, and it keeps _store and Upstash in lockstep, so
+# there is no need to round-trip to Redis on every page view / API call just
+# to re-read data that hasn't changed — that round trip was previously the
+# single biggest source of per-request latency in this app.
 _store = _load()
+_push_lock = asyncio.Lock()
+
+# Rendered-HTML cache, keyed by page. Invalidated purely by push_count, which
+# only ever changes inside /push — so this is a safe signal that "the data
+# behind this page changed" and lets us skip rebuilding ~unchanged markup
+# (string-building + f-string formatting over every tip/race/horse) on every
+# single request.
+_page_cache = {}
+
+def _cached_page(key, build_fn):
+    pc = _store.get("push_count", 0)
+    hit = _page_cache.get(key)
+    if hit and hit[0] == pc:
+        return hit[1]
+    html = build_fn()
+    _page_cache[key] = (pc, html)
+    return html
+
+@app.on_event("startup")
+async def _start_background_sync():
+    """Belt-and-braces: re-pull from Upstash every 45s in the background so
+    the in-memory store self-heals if this process restarts elsewhere or
+    another instance pushes — without making every request pay for it."""
+    async def _loop():
+        while True:
+            await asyncio.sleep(45)
+            try:
+                fresh = await run_in_threadpool(_load)
+                if fresh.get("push_count", 0) != _store.get("push_count", 0):
+                    _store.clear()
+                    _store.update(fresh)
+            except Exception:
+                pass
+    asyncio.create_task(_loop())
 
 @app.post("/push")
 async def push(request: Request, x_api_key: str = Header(default="")):
     if x_api_key != PUSH_API_KEY: raise HTTPException(status_code=401,detail="Invalid API key")
     try: body = await request.json()
     except: raise HTTPException(status_code=400,detail="Invalid JSON")
-    _store["tips"]        = body.get("tips",[])
-    _store["analyzer"]    = body.get("analyzer",[])
-    _store["live"]        = body.get("live",[])
-    _store["last_push"]   = body.get("generated_at") or datetime.datetime.now().isoformat()
-    _store["push_count"] += 1
-    _save(_store)
+    async with _push_lock:
+        _store["tips"]        = body.get("tips",[])
+        _store["analyzer"]    = body.get("analyzer",[])
+        _store["live"]        = body.get("live",[])
+        _store["last_push"]   = body.get("generated_at") or datetime.datetime.now().isoformat()
+        _store["push_count"] += 1
+        # Offloaded to a thread so the Upstash write (a blocking `requests`
+        # call) never stalls the event loop that's serving everyone else.
+        await run_in_threadpool(_save, _store)
     return {"status":"ok","tips":len(_store["tips"]),"analyzer_races":len(_store["analyzer"]),"live_races":len(_store["live"])}
 
 @app.get("/api/tips")
 async def api_tips():
-    return JSONResponse(_load()["tips"])
+    return JSONResponse(_store["tips"])
 
 @app.get("/api/analyzer")
 async def api_analyzer():
-    return JSONResponse(_load()["analyzer"])
+    return JSONResponse(_store["analyzer"])
 
 @app.get("/api/status")
 async def api_status():
-    s = _load()
-    return {"last_push":s["last_push"],"push_count":s["push_count"],"tips":len(s["tips"]),"analyzer_races":len(s["analyzer"])}
+    return {"last_push":_store["last_push"],"push_count":_store["push_count"],"tips":len(_store["tips"]),"analyzer_races":len(_store["analyzer"])}
 
 def _stat_row(label, value, suffix=""):
     """One label/value chip for the horse stat rundown. Returns '' if there's
@@ -299,6 +363,61 @@ def _time_key(tstr):
     except Exception:
         return 99999.0
 
+def _poll_script(push_count, page_id):
+    """Replaces a blind full-page reload every 90s with a cheap status poll
+    every 20s (now nearly free since /api/status reads straight from
+    memory). Only reloads when push_count actually changed, and stashes
+    scroll position / active tab / open accordion rows first so a real
+    update doesn't feel like the page just kicked you back to the top."""
+    if page_id == "watch":
+        return ""
+    return """
+(function(){
+  var _initialPush=__PUSH__;
+  function _saveUIState(){
+    try{
+      var state={scroll:window.scrollY,open:[]};
+      document.querySelectorAll('.rbody.open,.hdetail-row.open').forEach(function(el){ if(el.id) state.open.push(el.id); });
+      var activeTab=document.querySelector('.tab.active');
+      if(activeTab && activeTab.id) state.tab=activeTab.id;
+      sessionStorage.setItem('thepost_ui_state', JSON.stringify(state));
+    }catch(e){}
+  }
+  function _restoreUIState(){
+    try{
+      var raw=sessionStorage.getItem('thepost_ui_state');
+      if(!raw) return;
+      sessionStorage.removeItem('thepost_ui_state');
+      var state=JSON.parse(raw);
+      if(state.tab){
+        var btn=document.getElementById(state.tab);
+        if(btn) btn.click();
+      }
+      (state.open||[]).forEach(function(id){
+        var el=document.getElementById(id);
+        if(el){
+          el.classList.add('open');
+          if(el.previousElementSibling) el.previousElementSibling.classList.add('open');
+        }
+      });
+      if(typeof state.scroll==='number'){
+        setTimeout(function(){ window.scrollTo(0,state.scroll); },60);
+      }
+    }catch(e){}
+  }
+  _restoreUIState();
+  function _poll(){
+    fetch('/api/status').then(function(r){return r.json();}).then(function(s){
+      if(s && typeof s.push_count==='number' && s.push_count!==_initialPush){
+        _saveUIState();
+        location.reload();
+      }
+    }).catch(function(){});
+  }
+  setInterval(_poll, 20000);
+})();
+""".replace("__PUSH__", str(push_count))
+
 def _shell(page_id, body, store, friend=False):
     pushed = _pushed_str(store)
     total  = len(store["tips"])
@@ -317,7 +436,6 @@ def _shell(page_id, body, store, friend=False):
 <link rel="apple-touch-icon" href="/icon.png">
 <link rel="shortcut icon" href="/icon.png">
 <title>The Post</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" defer></script>
 <style>
 :root{--bg:#0B0F14;--panel:#121821;--el:#1A222D;--bd:#232C38;--t1:#E6EDF3;--t2:#8B98A5;--green:#2ECC71;--red:#E74C3C;--acc:#3A82F7;--warn:#F0A500;}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
@@ -605,8 +723,27 @@ function _seamlessLogo(){
   });
 }
 
+function _loadHtml2Canvas(){
+  // Loaded on demand (only when Export is actually tapped) instead of on
+  // every single page view — dash/analyzer/watch never used it anyway, and
+  // this trims a non-trivial chunk of JS off every page's initial load.
+  if(typeof html2canvas!=='undefined') return Promise.resolve();
+  if(window._h2cLoadPromise) return window._h2cLoadPromise;
+  window._h2cLoadPromise=new Promise(function(resolve,reject){
+    var s=document.createElement('script');
+    s.src='https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+    s.onload=function(){resolve();};
+    s.onerror=function(){ window._h2cLoadPromise=null; reject(new Error('load-failed')); };
+    document.head.appendChild(s);
+  });
+  return window._h2cLoadPromise;
+}
 function exportPhoto(){
-  if(typeof html2canvas==='undefined'){ alert('Export library failed to load — check your connection.'); return; }
+  _loadHtml2Canvas().then(_runExportPhoto).catch(function(){
+    alert('Export library failed to load — check your connection.');
+  });
+}
+function _runExportPhoto(){
   var activeSection=document.querySelector('.section.active');
   if(!activeSection){ alert('Nothing to export yet.'); return; }
 
@@ -753,7 +890,7 @@ function exportPhoto(){
     }
   });
 }
-""" + ("" if page_id=="watch" else "setTimeout(function(){location.reload();},90000);") + """
+""" + _poll_script(store.get("push_count", 0), page_id) + """
 </script>
 </body></html>"""
 
@@ -835,13 +972,11 @@ def _tips_body(store):
 
 @app.get("/", response_class=HTMLResponse)
 async def tips_page():
-    store = _load()
-    return HTMLResponse(_shell("tips", _tips_body(store), store))
+    return HTMLResponse(_cached_page("tips", lambda: _shell("tips", _tips_body(_store), _store)))
 
 @app.get("/portal", response_class=HTMLResponse)
 async def portal_tips_page():
-    store = _load()
-    return HTMLResponse(_shell("tips", _tips_body(store), store, friend=True))
+    return HTMLResponse(_cached_page("portal_tips", lambda: _shell("tips", _tips_body(_store), _store, friend=True)))
 
 def _dash_body(store, friend=False):
     tips     = store["tips"]
@@ -957,20 +1092,16 @@ def _dash_body(store, friend=False):
 
 @app.get("/dash", response_class=HTMLResponse)
 async def dash_page():
-    store = _load()
-    return HTMLResponse(_shell("dash", _dash_body(store), store))
+    return HTMLResponse(_cached_page("dash", lambda: _shell("dash", _dash_body(_store), _store)))
 
 @app.get("/portal/dash", response_class=HTMLResponse)
 async def portal_dash_page():
-    store = _load()
-    return HTMLResponse(_shell("dash", _dash_body(store, friend=True), store, friend=True))
+    return HTMLResponse(_cached_page("portal_dash", lambda: _shell("dash", _dash_body(_store, friend=True), _store, friend=True)))
 
-@app.get("/analyzer", response_class=HTMLResponse)
-async def analyzer_page():
-    store = _load()
+def _analyzer_body(store):
     races = sorted(store["analyzer"], key=lambda r: _time_key(r.get("time","")))
     if not races:
-        return HTMLResponse(_shell("analyzer",'<div class="content"><p class="empty">No analyzer data yet</p></div>', store))
+        return '<div class="content"><p class="empty">No analyzer data yet</p></div>'
     blocks = ""
     for r in races:
         rid = _race_id(r)
@@ -1073,7 +1204,11 @@ setInterval(_tickCountdowns, 15000);
   }
 })();
 </script>'''
-    return HTMLResponse(_shell("analyzer", sort_bar + f'<div class="content"><div id="races-container">{blocks}</div></div>' + countdown_script, store))
+    return sort_bar + f'<div class="content"><div id="races-container">{blocks}</div></div>' + countdown_script
+
+@app.get("/analyzer", response_class=HTMLResponse)
+async def analyzer_page():
+    return HTMLResponse(_cached_page("analyzer", lambda: _shell("analyzer", _analyzer_body(_store), _store)))
 
 # ---------------------------------------------------------------------------
 # Watch — embedded live-stream tab. Each source is the broadcaster's own
@@ -1133,13 +1268,11 @@ function switchWatch(id,btn){{
 
 @app.get("/watch", response_class=HTMLResponse)
 async def watch_page():
-    store = _load()
-    return HTMLResponse(_shell("watch", _watch_body(), store))
+    return HTMLResponse(_cached_page("watch", lambda: _shell("watch", _watch_body(), _store)))
 
 @app.get("/portal/watch", response_class=HTMLResponse)
 async def portal_watch_page():
-    store = _load()
-    return HTMLResponse(_shell("watch", _watch_body(), store, friend=True))
+    return HTMLResponse(_cached_page("portal_watch", lambda: _shell("watch", _watch_body(), _store, friend=True)))
 
 if __name__ == "__main__":
     import uvicorn
