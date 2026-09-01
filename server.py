@@ -10,6 +10,21 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.concurrency import run_in_threadpool
+from pywebpush import webpush, WebPushException
+
+try:
+    from zoneinfo import ZoneInfo
+    NOTIFY_TZ = ZoneInfo("Australia/Melbourne")
+except Exception:
+    # Falls back to fixed AEST (no daylight saving) if the system/tzdata
+    # package isn't available — add `tzdata` to requirements.txt to avoid this.
+    NOTIFY_TZ = datetime.timezone(datetime.timedelta(hours=10))
+
+# --- Web Push / VAPID config (jump-time notifications) ---
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:admin@example.com")
+NOTIFY_TYPES = ("BACK", "DEGEN", "LAY")  # PLACE is never notified
 
 PUSH_API_KEY = os.environ.get("PUSH_API_KEY", "thepost2026")
 
@@ -18,7 +33,7 @@ UPSTASH_URL   = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 STORE_KEY     = "thepost_store"
 
-DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "last_push": None, "push_count": 0}
+DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "last_push": None, "push_count": 0, "push_subs": {}}
 
 app = FastAPI(title="The Post", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -53,6 +68,17 @@ def _get_silk_url(d):
         or d.get("silk")     or d.get("Silk")
         or d.get("silk_image_url") or ""
     ).strip()
+
+def _get_horse_number(d):
+    """Pull whatever saddlecloth/runner-number field is present on a tip
+    dict, trying every naming convention the desktop client might push.
+    Returns '' (never a guess) if nothing is there."""
+    for k in ("number", "horse_number", "saddlecloth", "saddlecloth_number",
+              "runner_number", "tab_number", "program_number"):
+        v = d.get(k)
+        if v not in (None, ""):
+            return v
+    return ""
 
 def _silk_html(url, size=SILK_SIZE):
     """Render the shared silk component. If no silk is available, render an
@@ -172,6 +198,7 @@ def _save(s):
 # to re-read data that hasn't changed — that round trip was previously the
 # single biggest source of per-request latency in this app.
 _store = _load()
+_store.setdefault("push_subs", {})  # older persisted stores may predate this key
 _push_lock = asyncio.Lock()
 
 # Rendered-HTML cache, keyed by page. Invalidated purely by push_count, which
@@ -190,6 +217,92 @@ def _cached_page(key, build_fn):
     _page_cache[key] = (pc, html)
     return html
 
+# ---------------------------------------------------------------------------
+# Jump-time push notifications — BACK/DEGEN/LAY tips only, Saturdays only.
+# ---------------------------------------------------------------------------
+_notified = set()  # (sub_key, tip_id) already sent this run — in-memory only
+
+def _sub_key(endpoint):
+    return hashlib.sha1((endpoint or "").encode("utf-8")).hexdigest()[:16]
+
+def _tip_id(t):
+    raw = f'{t.get("type","")}|{t.get("track","")}|{t.get("race","")}|{t.get("time","")}|{t.get("horse","")}'
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+def _jump_dt_today(time_str, now):
+    """Turn a race's raw time string into a concrete datetime for `now`'s
+    date, reusing the same AM/PM inference _time_key already uses elsewhere
+    so notification timing always matches what the Analyzer countdown shows."""
+    minutes = _time_key(time_str)
+    if minutes is None or minutes >= 99999:
+        return None
+    h, m = divmod(int(minutes), 60)
+    if h >= 24:
+        return None
+    return now.replace(hour=h % 24, minute=m, second=0, microsecond=0)
+
+def _send_push_sync(subscription, payload):
+    webpush(
+        subscription_info=subscription,
+        data=json.dumps(payload),
+        vapid_private_key=VAPID_PRIVATE_KEY,
+        vapid_claims={"sub": VAPID_CLAIM_EMAIL},
+    )
+
+async def _notify_tick():
+    if not (VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY):
+        return  # push not configured on this deployment — nothing to do
+    now = datetime.datetime.now(NOTIFY_TZ)
+    if now.weekday() != 5:  # Saturday only — hard rule, no exceptions
+        return
+    subs = list(_store.get("push_subs", {}).items())
+    if not subs:
+        return
+    for t in _store.get("tips", []):
+        ttype = t.get("type")
+        if ttype not in NOTIFY_TYPES:
+            continue
+        jump = _jump_dt_today(t.get("time", ""), now)
+        if not jump:
+            continue
+        mins_out = (jump - now).total_seconds() / 60.0
+        tid = _tip_id(t)
+        silk = _get_silk_url(t)
+        icon = f"/silk?u={quote(silk, safe='')}" if (silk and not silk.startswith("data:")) else "/icon.png"
+        number = _get_horse_number(t)
+        horse_label = f'{number}. {t.get("horse","")}' if number != "" else t.get("horse", "")
+        for key, entry in subs:
+            prefs = entry.get("prefs", {})
+            if not prefs.get("enabled", True):
+                continue
+            if ttype == "DEGEN" and not prefs.get("degen", True):
+                continue
+            if ttype == "LAY" and not prefs.get("lay", True):
+                continue
+            lead = prefs.get("minutes_before", 5)
+            if not (0 <= mins_out <= lead):
+                continue
+            dedupe = (key, tid)
+            if dedupe in _notified:
+                continue
+            payload = {
+                "title": f'{t.get("track","")} {t.get("race","")} \u2014 {max(0, round(mins_out))} min to jump',
+                "body": f'{horse_label} \u00b7 {ttype.title()} \u00b7 {int(t.get("units",1))}u',
+                "icon": icon,
+                "tag": tid,
+                "url": "/",
+            }
+            try:
+                await run_in_threadpool(_send_push_sync, entry["subscription"], payload)
+                _notified.add(dedupe)
+            except WebPushException as e:
+                if "410" in str(e) or "404" in str(e):
+                    # Subscription expired/revoked on the browser's end — drop it.
+                    _store.get("push_subs", {}).pop(key, None)
+                    await run_in_threadpool(_save, _store)
+            except Exception:
+                pass
+
 @app.on_event("startup")
 async def _start_background_sync():
     """Belt-and-braces: re-pull from Upstash every 45s in the background so
@@ -203,6 +316,21 @@ async def _start_background_sync():
                 if fresh.get("push_count", 0) != _store.get("push_count", 0):
                     _store.clear()
                     _store.update(fresh)
+                    _store.setdefault("push_subs", {})
+            except Exception:
+                pass
+    asyncio.create_task(_loop())
+
+@app.on_event("startup")
+async def _start_notify_loop():
+    """Checks every 20s whether any tip has crossed into its notification
+    window. Cheap (in-memory only) and safe to run often — the Saturday
+    check and per-tip dedupe happen inside _notify_tick()."""
+    async def _loop():
+        while True:
+            await asyncio.sleep(20)
+            try:
+                await _notify_tick()
             except Exception:
                 pass
     asyncio.create_task(_loop())
@@ -234,6 +362,124 @@ async def api_analyzer():
 @app.get("/api/status")
 async def api_status():
     return {"last_push":_store["last_push"],"push_count":_store["push_count"],"tips":len(_store["tips"]),"analyzer_races":len(_store["analyzer"])}
+
+# ---------------------------------------------------------------------------
+# Push subscription management (Settings page)
+# ---------------------------------------------------------------------------
+
+def _default_prefs(overrides=None):
+    p = {"enabled": True, "degen": True, "lay": True, "minutes_before": 5}
+    if overrides:
+        p.update(overrides)
+    return p
+
+@app.get("/api/push/prefs")
+async def push_prefs_get(endpoint: str = ""):
+    if not endpoint:
+        return {"subscribed": False}
+    entry = _store.get("push_subs", {}).get(_sub_key(endpoint))
+    if not entry:
+        return {"subscribed": False}
+    return {"subscribed": True, "prefs": entry.get("prefs", _default_prefs())}
+
+@app.post("/api/push/subscribe")
+async def push_subscribe(request: Request):
+    try: body = await request.json()
+    except: raise HTTPException(status_code=400, detail="Invalid JSON")
+    sub = body.get("subscription") or {}
+    if not sub.get("endpoint"):
+        raise HTTPException(status_code=400, detail="Missing subscription")
+    prefs_in = body.get("prefs") or {}
+    key = _sub_key(sub["endpoint"])
+    _store.setdefault("push_subs", {})[key] = {
+        "subscription": sub,
+        "prefs": _default_prefs({
+            "enabled": bool(prefs_in.get("enabled", True)),
+            "degen": bool(prefs_in.get("degen", True)),
+            "lay": bool(prefs_in.get("lay", True)),
+            "minutes_before": max(1, min(60, int(prefs_in.get("minutes_before", 5) or 5))),
+        }),
+    }
+    await run_in_threadpool(_save, _store)
+    return {"status": "ok"}
+
+@app.post("/api/push/unsubscribe")
+async def push_unsubscribe(request: Request):
+    try: body = await request.json()
+    except: raise HTTPException(status_code=400, detail="Invalid JSON")
+    endpoint = (body.get("subscription") or {}).get("endpoint") or body.get("endpoint")
+    if endpoint:
+        _store.get("push_subs", {}).pop(_sub_key(endpoint), None)
+        await run_in_threadpool(_save, _store)
+    return {"status": "ok"}
+
+@app.post("/api/push/prefs")
+async def push_prefs_post(request: Request):
+    try: body = await request.json()
+    except: raise HTTPException(status_code=400, detail="Invalid JSON")
+    endpoint = (body.get("subscription") or {}).get("endpoint") or body.get("endpoint")
+    if not endpoint:
+        raise HTTPException(status_code=400, detail="Missing endpoint")
+    entry = _store.get("push_subs", {}).get(_sub_key(endpoint))
+    if not entry:
+        raise HTTPException(status_code=404, detail="Not subscribed")
+    prefs_in = body.get("prefs") or {}
+    if "enabled" in prefs_in: entry["prefs"]["enabled"] = bool(prefs_in["enabled"])
+    if "degen"   in prefs_in: entry["prefs"]["degen"]   = bool(prefs_in["degen"])
+    if "lay"     in prefs_in: entry["prefs"]["lay"]     = bool(prefs_in["lay"])
+    if "minutes_before" in prefs_in:
+        try: entry["prefs"]["minutes_before"] = max(1, min(60, int(prefs_in["minutes_before"])))
+        except (TypeError, ValueError): pass
+    await run_in_threadpool(_save, _store)
+    return {"status": "ok", "prefs": entry["prefs"]}
+
+@app.post("/api/push/test")
+async def push_test(request: Request):
+    if not (VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY):
+        raise HTTPException(status_code=503, detail="Push not configured on server")
+    try: body = await request.json()
+    except: raise HTTPException(status_code=400, detail="Invalid JSON")
+    sub = body.get("subscription")
+    if not sub or not sub.get("endpoint"):
+        raise HTTPException(status_code=400, detail="Missing subscription")
+    payload = {
+        "title": "The Post",
+        "body": "Test notification \u2014 jump-time alerts are set up on this device.",
+        "icon": "/icon.png",
+        "tag": "thepost-test",
+        "url": "/",
+    }
+    try:
+        await run_in_threadpool(_send_push_sync, sub, payload)
+    except WebPushException as e:
+        raise HTTPException(status_code=502, detail=f"Push failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Push failed: {e}")
+    return {"status": "ok"}
+
+@app.get("/sw.js")
+async def service_worker():
+    js = """
+self.addEventListener('push', function(event){
+  var data = {};
+  try { data = event.data ? event.data.json() : {}; } catch(e) {}
+  var title = data.title || 'The Post';
+  var options = {
+    body: data.body || '',
+    icon: data.icon || '/icon.png',
+    badge: '/icon.png',
+    tag: data.tag || undefined,
+    data: { url: data.url || '/' }
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+self.addEventListener('notificationclick', function(event){
+  event.notification.close();
+  var url = (event.notification.data && event.notification.data.url) || '/';
+  event.waitUntil(clients.openWindow(url));
+});
+"""
+    return Response(js, media_type="application/javascript")
 
 def _stat_row(label, value, suffix=""):
     """One label/value chip for the horse stat rundown. Returns '' if there's
@@ -558,6 +804,17 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 .watch-fallback span{font-size:10.5px;color:var(--t2);}
 .wbtn{background:#1A2E4A;border:1px solid var(--acc);color:var(--acc);padding:7px 13px;border-radius:8px;font-size:11px;font-weight:700;text-decoration:none;white-space:nowrap;flex-shrink:0;}
 .watch-note{font-size:10.5px;color:var(--t2);line-height:1.5;padding:2px 2px 10px;}
+.settings-row{display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--bd);gap:10px;}
+.settings-row:last-of-type{border-bottom:none;}
+.settings-row>span{font-size:12.5px;}
+.switch{position:relative;display:inline-block;width:42px;height:24px;flex-shrink:0;}
+.switch input{opacity:0;width:0;height:0;}
+.slider{position:absolute;cursor:pointer;inset:0;background:var(--el);border:1px solid var(--bd);border-radius:24px;transition:.15s;}
+.slider:before{position:absolute;content:"";height:18px;width:18px;left:2px;top:2px;background:var(--t2);border-radius:50%;transition:.15s;}
+input:checked + .slider{background:#1a3a1a;border-color:var(--green);}
+input:checked + .slider:before{transform:translateX(18px);background:var(--green);}
+.mins-input{width:56px;background:var(--el);border:1px solid var(--bd);color:var(--t1);border-radius:6px;padding:5px;text-align:center;font-size:12.5px;}
+.push-status{font-size:10.5px;color:var(--t2);margin-top:8px;}
 </style>
 </head>
 <body>
@@ -588,9 +845,11 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 <nav class="navbar">
 """ + ("""  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/portal/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
   <button class="nbtn """ + ("active" if page_id=="watch" else "") + """ " onclick="location.href='/portal/watch'"><span class="ni">&#x1F4FA;</span>Watch</button>
+  <button class="nbtn """ + ("active" if page_id=="settings" else "") + """ " onclick="location.href='/settings'"><span class="ni">&#x2699;&#xFE0F;</span>Settings</button>
 """ if friend else """  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
   <button class="nbtn """ + ("active" if page_id=="analyzer" else "") + """ " onclick="location.href='/analyzer'"><span class="ni">&#x1F50D;</span>Analyzer</button>
   <button class="nbtn """ + ("active" if page_id=="watch" else "") + """ " onclick="location.href='/watch'"><span class="ni">&#x1F4FA;</span>Watch</button>
+  <button class="nbtn """ + ("active" if page_id=="settings" else "") + """ " onclick="location.href='/settings'"><span class="ni">&#x2699;&#xFE0F;</span>Settings</button>
 """) + """</nav>
 <script>
 var _sortKey='track',_sortDir=1,_activeContainer='cards-container';
@@ -1273,6 +1532,148 @@ async def watch_page():
 @app.get("/portal/watch", response_class=HTMLResponse)
 async def portal_watch_page():
     return HTMLResponse(_cached_page("portal_watch", lambda: _shell("watch", _watch_body(), _store, friend=True)))
+
+# ---------------------------------------------------------------------------
+# Settings — jump-time push notifications. Subscriptions are per-device (the
+# browser's own push subscription), so this page talks to /api/push/* to
+# read/write settings for whichever device/browser has it open.
+# ---------------------------------------------------------------------------
+
+def _settings_body():
+    if not (VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY):
+        return ('<div class="content"><p class="empty">Push notifications aren\'t configured on '
+                'the server yet (missing VAPID keys).</p></div>')
+    return f'''<div class="content">
+<div class="card" style="margin-bottom:9px;">
+  <div class="stat-label" style="margin-bottom:2px;">Jump-Time Notifications</div>
+  <div class="settings-row">
+    <span>Enable on this device</span>
+    <label class="switch"><input type="checkbox" id="pref-enabled" onchange="onMasterToggle()"><span class="slider"></span></label>
+  </div>
+  <div class="settings-row">
+    <span>Degen bets</span>
+    <label class="switch"><input type="checkbox" id="pref-degen" checked onchange="savePrefsOnly()"><span class="slider"></span></label>
+  </div>
+  <div class="settings-row">
+    <span>Lay bets</span>
+    <label class="switch"><input type="checkbox" id="pref-lay" checked onchange="savePrefsOnly()"><span class="slider"></span></label>
+  </div>
+  <div class="settings-row">
+    <span>Minutes before jump</span>
+    <input type="number" id="pref-minutes" class="mins-input" min="1" max="60" value="5" onchange="savePrefsOnly()">
+  </div>
+  <button class="sbtn" style="width:100%;justify-content:center;margin-top:10px;" onclick="sendTestNotification()">&#x1F514; Send Test Notification</button>
+  <div id="push-status" class="push-status">Checking this device&hellip;</div>
+</div>
+<div class="card">
+  <div style="font-size:11px;color:var(--t2);line-height:1.6;">
+    Back bets always notify when this is on. Notifications only ever go out on <b>Saturdays</b> &mdash; even if races happen to be loaded on another day.
+  </div>
+</div>
+</div>
+<script>
+var VAPID_PUBLIC_KEY="{VAPID_PUBLIC_KEY}";
+function _b64ToUint8(b64){{
+  var pad='='.repeat((4-b64.length%4)%4);
+  var base64=(b64+pad).replace(/-/g,'+').replace(/_/g,'/');
+  var raw=atob(base64), arr=new Uint8Array(raw.length);
+  for(var i=0;i<raw.length;i++) arr[i]=raw.charCodeAt(i);
+  return arr;
+}}
+function _setStatus(msg){{ var el=document.getElementById('push-status'); if(el) el.textContent=msg; }}
+function _currentPrefs(){{
+  return {{
+    enabled: document.getElementById('pref-enabled').checked,
+    degen: document.getElementById('pref-degen').checked,
+    lay: document.getElementById('pref-lay').checked,
+    minutes_before: parseInt(document.getElementById('pref-minutes').value,10) || 5
+  }};
+}}
+async function _getSub(){{
+  if(!('serviceWorker' in navigator)) return null;
+  try{{
+    var reg=await navigator.serviceWorker.getRegistration('/sw.js');
+    if(!reg) return null;
+    return await reg.pushManager.getSubscription();
+  }}catch(e){{ return null; }}
+}}
+async function loadPushSettings(){{
+  if(!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)){{
+    _setStatus('Push notifications aren\\'t supported on this browser.');
+    document.getElementById('pref-enabled').disabled=true;
+    return;
+  }}
+  var sub=await _getSub();
+  if(!sub){{ _setStatus('Not enabled on this device yet.'); return; }}
+  try{{
+    var r=await fetch('/api/push/prefs?endpoint='+encodeURIComponent(sub.endpoint));
+    var s=await r.json();
+    if(s.subscribed){{
+      document.getElementById('pref-enabled').checked=!!s.prefs.enabled;
+      document.getElementById('pref-degen').checked=!!s.prefs.degen;
+      document.getElementById('pref-lay').checked=!!s.prefs.lay;
+      document.getElementById('pref-minutes').value=s.prefs.minutes_before||5;
+      _setStatus('Enabled on this device.');
+    }} else {{
+      _setStatus('Not enabled on this device yet.');
+    }}
+  }}catch(e){{ _setStatus('Could not load settings for this device.'); }}
+}}
+async function onMasterToggle(){{
+  if(document.getElementById('pref-enabled').checked){{ await enablePush(); }} else {{ await disablePush(); }}
+}}
+async function enablePush(){{
+  try{{
+    var perm=await Notification.requestPermission();
+    if(perm!=='granted'){{
+      document.getElementById('pref-enabled').checked=false;
+      _setStatus('Notification permission was not granted.');
+      return;
+    }}
+    var reg=await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.ready;
+    var sub=await reg.pushManager.getSubscription();
+    if(!sub){{
+      sub=await reg.pushManager.subscribe({{userVisibleOnly:true, applicationServerKey:_b64ToUint8(VAPID_PUBLIC_KEY)}});
+    }}
+    await fetch('/api/push/subscribe',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{subscription:sub.toJSON(),prefs:_currentPrefs()}})}});
+    _setStatus('Enabled on this device.');
+  }}catch(e){{
+    document.getElementById('pref-enabled').checked=false;
+    _setStatus('Could not enable notifications on this device.');
+  }}
+}}
+async function disablePush(){{
+  try{{
+    var sub=await _getSub();
+    if(sub){{
+      await fetch('/api/push/unsubscribe',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{endpoint:sub.endpoint}})}});
+      await sub.unsubscribe();
+    }}
+    _setStatus('Notifications disabled on this device.');
+  }}catch(e){{ _setStatus('Could not fully disable \u2014 try again.'); }}
+}}
+async function savePrefsOnly(){{
+  var sub=await _getSub();
+  if(!sub) return;
+  await fetch('/api/push/prefs',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{endpoint:sub.endpoint,prefs:_currentPrefs()}})}});
+}}
+async function sendTestNotification(){{
+  var sub=await _getSub();
+  if(!sub){{ _setStatus('Enable notifications on this device first.'); return; }}
+  _setStatus('Sending test notification\u2026');
+  try{{
+    var r=await fetch('/api/push/test',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{subscription:sub.toJSON()}})}});
+    if(r.ok) _setStatus('Test sent \u2014 check your notifications.');
+    else _setStatus('Test failed to send.');
+  }}catch(e){{ _setStatus('Test failed to send.'); }}
+}}
+loadPushSettings();
+</script>'''
+
+@app.get("/settings", response_class=HTMLResponse)
+async def settings_page():
+    return HTMLResponse(_cached_page("settings", lambda: _shell("settings", _settings_body(), _store)))
 
 if __name__ == "__main__":
     import uvicorn
