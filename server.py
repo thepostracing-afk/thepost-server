@@ -35,7 +35,7 @@ except Exception:
 # --- Web Push / VAPID config (jump-time notifications) ---
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
-VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:admin@example.com")
+VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "").strip() or "mailto:admin@example.com"
 NOTIFY_TYPES = ("BACK", "DEGEN", "LAY")  # PLACE is never notified
 # Single source of truth for "can we actually send a push right now" — the
 # library has to be installed AND both VAPID keys have to be set.
