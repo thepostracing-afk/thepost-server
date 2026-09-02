@@ -10,7 +10,19 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.concurrency import run_in_threadpool
-from pywebpush import webpush, WebPushException
+
+try:
+    from pywebpush import webpush, WebPushException
+    _PUSH_LIB_AVAILABLE = True
+except ImportError:
+    # Lets the whole app boot even if `pywebpush` hasn't been deployed yet —
+    # jump-time notifications just stay off instead of taking the tips
+    # server down. Add `pywebpush` to requirements.txt to enable them.
+    _PUSH_LIB_AVAILABLE = False
+    class WebPushException(Exception):
+        pass
+    def webpush(*args, **kwargs):
+        raise WebPushException("pywebpush is not installed on the server")
 
 try:
     from zoneinfo import ZoneInfo
@@ -25,6 +37,9 @@ VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:admin@example.com")
 NOTIFY_TYPES = ("BACK", "DEGEN", "LAY")  # PLACE is never notified
+# Single source of truth for "can we actually send a push right now" — the
+# library has to be installed AND both VAPID keys have to be set.
+_PUSH_READY = _PUSH_LIB_AVAILABLE and bool(VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY)
 
 PUSH_API_KEY = os.environ.get("PUSH_API_KEY", "thepost2026")
 
@@ -250,8 +265,8 @@ def _send_push_sync(subscription, payload):
     )
 
 async def _notify_tick():
-    if not (VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY):
-        return  # push not configured on this deployment — nothing to do
+    if not _PUSH_READY:
+        return  # push not configured (or pywebpush not installed) — nothing to do
     now = datetime.datetime.now(NOTIFY_TZ)
     if now.weekday() != 5:  # Saturday only — hard rule, no exceptions
         return
@@ -435,7 +450,7 @@ async def push_prefs_post(request: Request):
 
 @app.post("/api/push/test")
 async def push_test(request: Request):
-    if not (VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY):
+    if not _PUSH_READY:
         raise HTTPException(status_code=503, detail="Push not configured on server")
     try: body = await request.json()
     except: raise HTTPException(status_code=400, detail="Invalid JSON")
@@ -452,9 +467,11 @@ async def push_test(request: Request):
     try:
         await run_in_threadpool(_send_push_sync, sub, payload)
     except WebPushException as e:
+        print(f"[push/test] WebPushException: {e}")
         raise HTTPException(status_code=502, detail=f"Push failed: {e}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Push failed: {e}")
+        print(f"[push/test] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=502, detail=f"Push failed: {type(e).__name__}: {e}")
     return {"status": "ok"}
 
 @app.get("/sw.js")
@@ -1540,6 +1557,9 @@ async def portal_watch_page():
 # ---------------------------------------------------------------------------
 
 def _settings_body():
+    if not _PUSH_LIB_AVAILABLE:
+        return ('<div class="content"><p class="empty">Push notifications need the <code>pywebpush</code> '
+                'package on the server — add it to requirements.txt and redeploy.</p></div>')
     if not (VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY):
         return ('<div class="content"><p class="empty">Push notifications aren\'t configured on '
                 'the server yet (missing VAPID keys).</p></div>')
@@ -1664,9 +1684,11 @@ async function sendTestNotification(){{
   _setStatus('Sending test notification\u2026');
   try{{
     var r=await fetch('/api/push/test',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{subscription:sub.toJSON()}})}});
-    if(r.ok) _setStatus('Test sent \u2014 check your notifications.');
-    else _setStatus('Test failed to send.');
-  }}catch(e){{ _setStatus('Test failed to send.'); }}
+    if(r.ok){{ _setStatus('Test sent \u2014 check your notifications.'); return; }}
+    var msg='Test failed to send.';
+    try{{ var e=await r.json(); if(e && e.detail) msg='Failed: '+e.detail; }}catch(parseErr){{}}
+    _setStatus(msg);
+  }}catch(e){{ _setStatus('Test failed to send (network error reaching the server).'); }}
 }}
 loadPushSettings();
 </script>'''
