@@ -1216,8 +1216,11 @@ def _cards_js(tips_list, label, container_id):
         return f'<p class="empty">No {label} picks yet</p>'
     out = f'<div id="{container_id}">'
     for t in tips_list:
-        cls = (t.get("tag") or "").lower().replace(" ","-")
-        tag_html = f'<span class="tag {cls}">{t["tag"]}</span>' if t.get("tag") else ""
+        tag_val = t.get("tag") or ""
+        cls = tag_val.lower().replace(" ","-")
+        # SECONDARY and TOP PLAY badges are hidden per your call — WATCH
+        # (and anything else) still shows.
+        tag_html = f'<span class="tag {cls}">{tag_val}</span>' if tag_val and tag_val not in ("TOP PLAY", "SECONDARY") else ""
         vc  = "pos" if t.get("value_pct",0)>0 else "neg"
         out += (
             f'<div class="card sortable-card"'
@@ -1229,7 +1232,7 @@ def _cards_js(tips_list, label, container_id):
             f' data-rsi="{t.get("rsi",0)}"'
             f' data-real_odds="{t.get("real_odds",0)}"'
             f' data-horse="{t.get("horse","")}">'
-            f'<div class="ctop"><span class="horse-row"><span class="horse">{t.get("horse","")}</span></span>{tag_html}</div>'
+            f'<div class="ctop"><span class="horse-row">{_silk_html(_get_silk_url(t))}<span class="horse">{t.get("horse","")}</span></span>{tag_html}</div>'
             f'<div class="meta">{t.get("time","")} &middot; {t.get("track","")} &middot; {t.get("race","")}</div>'
             f'<div class="stats">'
             f'<div class="stat"><span class="sl">ODDS</span><span class="sv">${t.get("real_odds",0):.2f}</span></div>'
