@@ -767,10 +767,23 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 .sv{font-size:12px;font-weight:700;white-space:nowrap;}
 .pos{color:var(--green);}.neg{color:var(--red);}
 .summary{display:flex;gap:6px;margin-bottom:10px;}
-.sc{flex:1;background:var(--panel);border:1px solid var(--bd);border-radius:8px;padding:8px 4px;text-align:center;}
+.sc{flex:1;background:var(--panel);border:1px solid var(--bd);border-radius:8px;padding:9px 4px 8px;text-align:center;transition:transform .1s;}
 .sc-link{cursor:pointer;}
-.sn{font-size:18px;font-weight:700;}.sl2{font-size:9px;color:var(--t2);text-transform:uppercase;letter-spacing:.4px;}
+.sc-link:active{transform:scale(.97);}
+.sn{font-size:20px;font-weight:800;line-height:1.1;}.sl2{font-size:9px;color:var(--t2);text-transform:uppercase;letter-spacing:.4px;margin-top:1px;}
+.sc-pct{font-size:8.5px;color:var(--t2);margin-top:3px;opacity:.75;}
 .stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:10px;}
+.spotlight-card{border-left:3px solid var(--green);background:linear-gradient(135deg,rgba(46,204,113,.08),var(--panel) 60%);}
+.spot-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:2px;}
+.spot-horse{font-size:16px;font-weight:800;}
+.spot-meta{font-size:10.5px;color:var(--t2);margin-bottom:9px;}
+.spot-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;}
+.spot-item{background:var(--el);border-radius:6px;padding:6px 3px;text-align:center;display:flex;flex-direction:column;gap:2px;}
+.type-bar{display:flex;width:100%;height:9px;border-radius:5px;overflow:hidden;background:var(--el);margin-bottom:9px;}
+.type-seg{height:100%;}
+.type-legend{display:flex;gap:14px;flex-wrap:wrap;font-size:10.5px;color:var(--t2);}
+.type-legend span{display:inline-flex;align-items:center;gap:5px;}
+.type-legend i{width:8px;height:8px;border-radius:50%;display:inline-block;}
 .stat-card{background:var(--panel);border:1px solid var(--bd);border-radius:9px;padding:10px 11px;border-left:3px solid var(--acc);}
 .stat-card.green{border-left-color:var(--green);}
 .stat-card.red{border-left-color:var(--red);}
@@ -1348,11 +1361,18 @@ def _dash_body(store, friend=False):
     multi = [t for t in tips if t["type"]=="MULTI"]
     all_t = back+place+multi
     total_u  = sum(t.get("units",0) for t in all_t)
-    # Multis don't carry a single-runner win_pct/real_odds — those averages
-    # are only meaningful across the priced single-horse tips.
-    priced   = back+place
-    avg_odds = (sum(t.get("real_odds",0) for t in priced)/len(priced)) if priced else 0
-    avg_win  = (sum(t.get("win_pct",0) for t in priced)/len(priced)) if priced else 0
+    back_u   = sum(t.get("units",0) for t in back)
+    place_u  = sum(t.get("units",0) for t in place)
+    multi_u  = sum(t.get("units",0) for t in multi)
+    # Multis don't carry a single-runner win_pct/real_odds/rsi — those
+    # averages are only meaningful across the priced single-horse tips.
+    priced    = back+place
+    avg_odds  = (sum(t.get("real_odds",0) for t in priced)/len(priced)) if priced else 0
+    avg_win   = (sum(t.get("win_pct",0) for t in priced)/len(priced)) if priced else 0
+    avg_rsi   = (sum(t.get("rsi",0) for t in priced)/len(priced)) if priced else 0
+    top_plays = sum(1 for t in back if t.get("tag")=="TOP PLAY")
+    best      = max(priced, key=lambda t: t.get("value_pct",0), default=None)
+
     track_set = set()
     for t in all_t:
         if t.get("type")=="MULTI":
@@ -1368,11 +1388,62 @@ def _dash_body(store, friend=False):
     tips_base = "/portal" if friend else "/"
 
     # Bet-type boxes are now the only route into Tips — clicking one jumps
-    # straight to that tab.
+    # straight to that tab. Each also shows its share of today's selections
+    # and gets a colour-matched top edge so the three read as a set.
     def _sc(tid, count, color, label):
+        pct = round(100*count/len(all_t)) if all_t else 0
         return (
-            f'<div class="sc sc-link" onclick="location.href=\'{tips_base}?tab={tid}\'">'
-            f'<div class="sn" style="color:{color}">{count}</div><div class="sl2">{label}</div></div>'
+            f'<div class="sc sc-link" style="border-top:2px solid {color};" '
+            f'onclick="location.href=\'{tips_base}?tab={tid}\'">'
+            f'<div class="sn" style="color:{color}">{count}</div>'
+            f'<div class="sl2">{label}</div>'
+            f'<div class="sc-pct">{pct}% of tips</div></div>'
+        )
+
+    # Best Value spotlight — the single highest-value priced selection today,
+    # surfaced up top since it's the one pick most worth a second look.
+    spotlight_html = ""
+    if best:
+        b_type = best.get("type","")
+        type_color = "var(--green)" if b_type=="BACK" else "var(--acc)"
+        spotlight_html = (
+            '<div class="card spotlight-card" style="margin-bottom:9px;">'
+            '<div class="stat-label" style="margin-bottom:6px;">&#x2B50; Best Value Today</div>'
+            '<div class="spot-top">'
+            f'<div class="spot-horse">{best.get("horse","")}</div>'
+            f'<span class="tag" style="background:transparent;border:1px solid {type_color};color:{type_color};">{b_type}</span>'
+            '</div>'
+            f'<div class="spot-meta">{best.get("time","")} &middot; {best.get("track","")} &middot; {best.get("race","")}</div>'
+            '<div class="spot-stats">'
+            f'<div class="spot-item"><span class="hsl">ODDS</span><span class="hsv">${best.get("real_odds",0):.2f}</span></div>'
+            f'<div class="spot-item"><span class="hsl">VALUE</span><span class="hsv pos">{best.get("value_pct",0):+.1f}%</span></div>'
+            f'<div class="spot-item"><span class="hsl">RSI</span><span class="hsv">{int(best.get("rsi",0))}</span></div>'
+            f'<div class="spot-item"><span class="hsl">WIN%</span><span class="hsv">{best.get("win_pct",0):.1f}%</span></div>'
+            '</div>'
+            '</div>'
+        )
+
+    # Units-by-type bar — quick visual read on where today's stake is
+    # concentrated, only shown once there's actually something staked.
+    type_bar_html = ""
+    if total_u > 0:
+        back_pct  = round(100*back_u/total_u)
+        place_pct = round(100*place_u/total_u)
+        multi_pct = max(0, 100-back_pct-place_pct)
+        type_bar_html = (
+            '<div class="card" style="margin-bottom:9px;">'
+            '<div class="stat-label" style="margin-bottom:8px;">Units By Type</div>'
+            '<div class="type-bar">'
+            f'<div class="type-seg" style="width:{back_pct}%;background:var(--green);"></div>'
+            f'<div class="type-seg" style="width:{place_pct}%;background:var(--acc);"></div>'
+            f'<div class="type-seg" style="width:{multi_pct}%;background:var(--warn);"></div>'
+            '</div>'
+            '<div class="type-legend">'
+            f'<span><i style="background:var(--green);"></i>Back {back_u:.0f}u</span>'
+            f'<span><i style="background:var(--acc);"></i>Place {place_u:.0f}u</span>'
+            f'<span><i style="background:var(--warn);"></i>Multi {multi_u:.0f}u</span>'
+            '</div>'
+            '</div>'
         )
 
     # Next 5 races — every race is rendered as a hidden template row tagged
@@ -1449,11 +1520,15 @@ def _dash_body(store, friend=False):
         + _sc("tp", len(place), "var(--acc)",   "Place")
         + _sc("tm", len(multi), "var(--warn)",  "Multi")
         + '</div>'
+        + spotlight_html +
         '<div class="stat-grid">'
         f'<div class="stat-card green"><div class="stat-label">Total Units</div><div class="stat-value">{total_u:.0f}u</div><div class="stat-sub">{len(all_t)} selections</div></div>'
         f'<div class="stat-card warn"><div class="stat-label">Avg Odds</div><div class="stat-value">${avg_odds:.2f}</div><div class="stat-sub">Avg win {avg_win:.1f}%</div></div>'
+        f'<div class="stat-card"><div class="stat-label">Avg RSI</div><div class="stat-value">{avg_rsi:.0f}</div><div class="stat-sub">Back + Place</div></div>'
+        f'<div class="stat-card green"><div class="stat-label">Top Plays</div><div class="stat-value">{top_plays}</div><div class="stat-sub">of {len(back)} back bets</div></div>'
         f'<div class="stat-card green" style="grid-column:1/-1;"><div class="stat-label">Races Loaded</div><div class="stat-value">{t_races}</div><div class="stat-sub">{t_run} runners</div></div>'
         '</div>'
+        + type_bar_html
         + next_html +
         f'<div class="card" style="margin-bottom:9px;"><div class="stat-label" style="margin-bottom:8px;">Tracks Today</div><div style="font-size:13px;line-height:1.6;">{tracks}</div></div>'
         f'<div class="card"><div class="stat-label" style="margin-bottom:8px;">Last Push</div><div style="font-size:14px;font-weight:600;">{pushed}</div><div style="font-size:11px;color:var(--t2);margin-top:3px;">Push #{store["push_count"]}</div></div>'
