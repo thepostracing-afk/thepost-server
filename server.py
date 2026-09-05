@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Post — Live Tips Server  v5 (persistent storage via Upstash Redis)"""
+"""The Post — Live Tips Server  v6 (persistent storage via Upstash Redis)"""
 
 import os, json, datetime, base64, hashlib, asyncio
 from collections import OrderedDict
@@ -36,7 +36,7 @@ except Exception:
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "").strip() or "mailto:admin@example.com"
-NOTIFY_TYPES = ("BACK", "DEGEN", "LAY")  # PLACE is never notified
+NOTIFY_TYPES = ("BACK", "PLACE", "MULTI")
 # Single source of truth for "can we actually send a push right now" — the
 # library has to be installed AND both VAPID keys have to be set.
 _PUSH_READY = _PUSH_LIB_AVAILABLE and bool(VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY)
@@ -233,7 +233,7 @@ def _cached_page(key, build_fn):
     return html
 
 # ---------------------------------------------------------------------------
-# Jump-time push notifications — BACK/DEGEN/LAY tips only, Saturdays only.
+# Jump-time push notifications — BACK/PLACE/MULTI tips only, Saturdays only.
 # ---------------------------------------------------------------------------
 _notified = set()  # (sub_key, tip_id) already sent this run — in-memory only
 
@@ -241,7 +241,14 @@ def _sub_key(endpoint):
     return hashlib.sha1((endpoint or "").encode("utf-8")).hexdigest()[:16]
 
 def _tip_id(t):
-    raw = f'{t.get("type","")}|{t.get("track","")}|{t.get("race","")}|{t.get("time","")}|{t.get("horse","")}'
+    if t.get("type") == "MULTI":
+        legs_key = "|".join(
+            f'{l.get("track","")}-{l.get("race","")}-{l.get("horse","")}'
+            for l in (t.get("legs") or [])
+        )
+        raw = f'MULTI|{t.get("time","")}|{legs_key}'
+    else:
+        raw = f'{t.get("type","")}|{t.get("track","")}|{t.get("race","")}|{t.get("time","")}|{t.get("horse","")}'
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 def _jump_dt_today(time_str, now):
@@ -282,17 +289,27 @@ async def _notify_tick():
             continue
         mins_out = (jump - now).total_seconds() / 60.0
         tid = _tip_id(t)
-        silk = _get_silk_url(t)
+        if ttype == "MULTI":
+            legs = t.get("legs", []) or []
+            first_leg = legs[0] if legs else {}
+            silk = _get_silk_url(first_leg)
+            horse_label = f'{len(legs)}-Leg Multi'
+            track_label = first_leg.get("track", t.get("track",""))
+            race_label  = first_leg.get("race", t.get("race",""))
+        else:
+            silk = _get_silk_url(t)
+            number = _get_horse_number(t)
+            horse_label = f'{number}. {t.get("horse","")}' if number != "" else t.get("horse", "")
+            track_label = t.get("track","")
+            race_label  = t.get("race","")
         icon = f"/silk?u={quote(silk, safe='')}" if (silk and not silk.startswith("data:")) else "/icon.png"
-        number = _get_horse_number(t)
-        horse_label = f'{number}. {t.get("horse","")}' if number != "" else t.get("horse", "")
         for key, entry in subs:
             prefs = entry.get("prefs", {})
             if not prefs.get("enabled", True):
                 continue
-            if ttype == "DEGEN" and not prefs.get("degen", True):
+            if ttype == "PLACE" and not prefs.get("place", True):
                 continue
-            if ttype == "LAY" and not prefs.get("lay", True):
+            if ttype == "MULTI" and not prefs.get("multi", True):
                 continue
             lead = prefs.get("minutes_before", 5)
             if not (0 <= mins_out <= lead):
@@ -301,7 +318,7 @@ async def _notify_tick():
             if dedupe in _notified:
                 continue
             payload = {
-                "title": f'{t.get("track","")} {t.get("race","")} \u2014 {max(0, round(mins_out))} min to jump',
+                "title": f'{track_label} {race_label} \u2014 {max(0, round(mins_out))} min to jump',
                 "body": f'{horse_label} \u00b7 {ttype.title()} \u00b7 {int(t.get("units",1))}u',
                 "icon": icon,
                 "tag": tid,
@@ -383,7 +400,7 @@ async def api_status():
 # ---------------------------------------------------------------------------
 
 def _default_prefs(overrides=None):
-    p = {"enabled": True, "degen": True, "lay": True, "minutes_before": 5}
+    p = {"enabled": True, "place": True, "multi": True, "minutes_before": 5}
     if overrides:
         p.update(overrides)
     return p
@@ -410,8 +427,8 @@ async def push_subscribe(request: Request):
         "subscription": sub,
         "prefs": _default_prefs({
             "enabled": bool(prefs_in.get("enabled", True)),
-            "degen": bool(prefs_in.get("degen", True)),
-            "lay": bool(prefs_in.get("lay", True)),
+            "place": bool(prefs_in.get("place", True)),
+            "multi": bool(prefs_in.get("multi", True)),
             "minutes_before": max(1, min(60, int(prefs_in.get("minutes_before", 5) or 5))),
         }),
     }
@@ -440,8 +457,8 @@ async def push_prefs_post(request: Request):
         raise HTTPException(status_code=404, detail="Not subscribed")
     prefs_in = body.get("prefs") or {}
     if "enabled" in prefs_in: entry["prefs"]["enabled"] = bool(prefs_in["enabled"])
-    if "degen"   in prefs_in: entry["prefs"]["degen"]   = bool(prefs_in["degen"])
-    if "lay"     in prefs_in: entry["prefs"]["lay"]     = bool(prefs_in["lay"])
+    if "place"   in prefs_in: entry["prefs"]["place"]   = bool(prefs_in["place"])
+    if "multi"   in prefs_in: entry["prefs"]["multi"]   = bool(prefs_in["multi"])
     if "minutes_before" in prefs_in:
         try: entry["prefs"]["minutes_before"] = max(1, min(60, int(prefs_in["minutes_before"])))
         except (TypeError, ValueError): pass
@@ -803,6 +820,15 @@ img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 .hstat-empty{color:var(--t2);font-size:11px;padding:6px 2px;}
 .hnotes{margin-top:8px;background:var(--el);border-radius:6px;padding:6px 8px;}
 .hnotes p{font-size:11px;color:var(--t1);line-height:1.4;margin-top:3px;}
+.multi-legs{display:flex;flex-direction:column;gap:6px;margin-bottom:8px;}
+.multi-leg{display:flex;align-items:center;gap:8px;background:var(--el);border-radius:6px;padding:6px 8px;}
+.multi-leg-info{flex:1;min-width:0;}
+.multi-leg-horse{font-size:11.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.multi-leg-meta{font-size:9.5px;color:var(--t2);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.multi-leg-odds{font-size:12px;font-weight:700;color:var(--acc);flex-shrink:0;}
+.multi-foot{display:flex;gap:6px;}
+.mf-item{flex:1;background:var(--el);border-radius:6px;padding:6px 3px;text-align:center;display:flex;flex-direction:column;gap:2px;}
+.multi-card .horse{font-size:13.5px;font-weight:700;}
 .modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;align-items:flex-end;justify-content:center;}
 .modal-bg.open{display:flex;}
 .modal{background:var(--panel);border-radius:16px 16px 0 0;padding:20px 16px 32px;width:100%;max-width:480px;}
@@ -883,7 +909,7 @@ function closeShare(){document.getElementById('share-modal').classList.remove('o
 function buildShareText(){
   var lines=['The Post - Tips\\n'],pushed=document.querySelector('.status');
   if(pushed) lines.push(pushed.textContent.trim()+'\\n');
-  var containers=['cards-container','cards-container-d','cards-container-l','cards-container-p'];
+  var containers=['cards-container','cards-container-p','cards-container-m'];
   containers.forEach(function(cid){
     var c=document.getElementById(cid);
     if(!c||c.closest('.section:not(.active)')) return;
@@ -905,7 +931,7 @@ function shareVia(method){
   else if(method==='copy') navigator.clipboard.writeText(txt).then(function(){alert('Copied!');});
   closeShare();
 }
-function setContainer(id){var m={tb:'cards-container',td:'cards-container-d',tl:'cards-container-l',tp:'cards-container-p'};_activeContainer=m[id]||'cards-container';}
+function setContainer(id){var m={tb:'cards-container',tp:'cards-container-p',tm:'cards-container-m'};_activeContainer=m[id]||'cards-container';}
 function switchTab(id,btn,grp){
   document.querySelectorAll('[data-grp="'+grp+'"]').forEach(function(s){s.classList.remove('active');});
   document.querySelectorAll('[data-tab="'+grp+'"]').forEach(function(b){b.classList.remove('active');});
@@ -1201,12 +1227,75 @@ def _cards_js(tips_list, label, container_id):
     out += "</div>"
     return out
 
+# ---------------------------------------------------------------------------
+# Multi cards — a multi bet chains several race legs into one parlay, so it
+# gets its own nicely laid-out card: one compact row per leg (silk, horse,
+# where/when, leg odds) and a two-tile footer for the combined price + stake,
+# instead of forcing it into the single-horse stat-grid used by Back/Place.
+# ---------------------------------------------------------------------------
+
+def _multi_leg_html(leg):
+    number = _get_horse_number(leg)
+    horse_label = f'{number}. {leg.get("horse","")}' if number != "" else leg.get("horse","")
+    odds = leg.get("odds", leg.get("real_odds", 0)) or 0
+    return (
+        '<div class="multi-leg">'
+        f'{_silk_html(_get_silk_url(leg))}'
+        '<div class="multi-leg-info">'
+        f'<div class="multi-leg-horse">{horse_label}</div>'
+        f'<div class="multi-leg-meta">{leg.get("time","")} &middot; {leg.get("track","")} &middot; {leg.get("race","")}</div>'
+        '</div>'
+        f'<div class="multi-leg-odds">${float(odds):.2f}</div>'
+        '</div>'
+    )
+
+def _multi_card_html(t):
+    legs = t.get("legs", []) or []
+    tag_cls = (t.get("tag") or "").lower().replace(" ","-")
+    tag_html = f'<span class="tag {tag_cls}">{t["tag"]}</span>' if t.get("tag") else ""
+    legs_html = "".join(_multi_leg_html(l) for l in legs)
+    combined = float(t.get("combined_odds", 0) or 0)
+    units = t.get("units", 1)
+    tracks = ", ".join(dict.fromkeys(l.get("track","") for l in legs if l.get("track")))
+    first_time = legs[0].get("time","") if legs else t.get("time","")
+    title = f'{len(legs)}-Leg Multi' if legs else "Multi"
+    return (
+        '<div class="card multi-card sortable-card"'
+        f' data-time="{first_time}"'
+        f' data-units="{units}"'
+        f' data-track="{tracks}"'
+        f' data-race="Multi"'
+        f' data-win_pct="0"'
+        f' data-rsi="{t.get("avg_rsi",0)}"'
+        f' data-real_odds="{combined}"'
+        f' data-horse="{title}">'
+        f'<div class="ctop"><span class="horse-row"><span class="horse">{title}</span></span>{tag_html}</div>'
+        f'<div class="meta">{tracks}</div>'
+        f'<div class="multi-legs">{legs_html}</div>'
+        '<div class="multi-foot">'
+        f'<div class="mf-item"><span class="sl">COMBINED ODDS</span><span class="sv">${combined:.2f}</span></div>'
+        f'<div class="mf-item"><span class="sl">UNITS</span><span class="sv">{int(units)}u</span></div>'
+        '</div>'
+        '</div>'
+    )
+
+def _cards_multi_js(tips_list):
+    if not tips_list:
+        return '<p class="empty">No multis yet</p>'
+    out = '<div id="cards-container-m">'
+    for t in tips_list:
+        out += _multi_card_html(t)
+    out += "</div>"
+    return out
+
 def _tips_body(store):
     tips  = store["tips"]
     back  = sorted([t for t in tips if t["type"]=="BACK"],  key=lambda t: t.get("track",""))
-    degen = sorted([t for t in tips if t["type"]=="DEGEN"], key=lambda t: t.get("track",""))
-    lay   = sorted([t for t in tips if t["type"]=="LAY"],   key=lambda t: t.get("track",""))
     place = sorted([t for t in tips if t["type"]=="PLACE"], key=lambda t: t.get("track",""))
+    multi = sorted(
+        [t for t in tips if t["type"]=="MULTI"],
+        key=lambda t: -(t.get("avg_rsi",0) or 0)
+    )
     sort_bar = (
         '<div class="sortbar">'
         '<button class="sort-btn" onclick="sortBy(\'time\',this)">&#x1F550; Time</button>'
@@ -1220,22 +1309,19 @@ def _tips_body(store):
     return (
         '<div class="tabs">'
         f'<button id="btn-tb" class="tab active" data-tab="tips" onclick="switchTab(\'tb\',this,\'tips\');setContainer(\'tb\')">Back ({len(back)})</button>'
-        f'<button id="btn-td" class="tab" data-tab="tips" onclick="switchTab(\'td\',this,\'tips\');setContainer(\'td\')">Degen ({len(degen)})</button>'
-        f'<button id="btn-tl" class="tab" data-tab="tips" onclick="switchTab(\'tl\',this,\'tips\');setContainer(\'tl\')">Lay ({len(lay)})</button>'
         f'<button id="btn-tp" class="tab" data-tab="tips" onclick="switchTab(\'tp\',this,\'tips\');setContainer(\'tp\')">Place ({len(place)})</button>'
+        f'<button id="btn-tm" class="tab" data-tab="tips" onclick="switchTab(\'tm\',this,\'tips\');setContainer(\'tm\')">Multi ({len(multi)})</button>'
         '</div>'
         + sort_bar +
         '<div class="content">'
         '<div class="summary">'
         f'<div class="sc"><div class="sn" style="color:var(--green)">{len(back)}</div><div class="sl2">Back</div></div>'
-        f'<div class="sc"><div class="sn" style="color:var(--warn)">{len(degen)}</div><div class="sl2">Degen</div></div>'
-        f'<div class="sc"><div class="sn" style="color:var(--red)">{len(lay)}</div><div class="sl2">Lay</div></div>'
         f'<div class="sc"><div class="sn" style="color:var(--acc)">{len(place)}</div><div class="sl2">Place</div></div>'
+        f'<div class="sc"><div class="sn" style="color:var(--warn)">{len(multi)}</div><div class="sl2">Multi</div></div>'
         '</div>'
         f'<div class="section active" id="tb" data-grp="tips">{_cards_js(back,"back","cards-container")}</div>'
-        f'<div class="section" id="td" data-grp="tips">{_cards_js(degen,"degen","cards-container-d")}</div>'
-        f'<div class="section" id="tl" data-grp="tips">{_cards_js(lay,"lay","cards-container-l")}</div>'
         f'<div class="section" id="tp" data-grp="tips">{_cards_js(place,"place","cards-container-p")}</div>'
+        f'<div class="section" id="tm" data-grp="tips">{_cards_multi_js(multi)}</div>'
         '</div>'
         '<script>'
         '(function(){'
@@ -1258,14 +1344,23 @@ def _dash_body(store, friend=False):
     tips     = store["tips"]
     analyzer = store["analyzer"]
     back  = [t for t in tips if t["type"]=="BACK"]
-    degen = [t for t in tips if t["type"]=="DEGEN"]
-    lay   = [t for t in tips if t["type"]=="LAY"]
     place = [t for t in tips if t["type"]=="PLACE"]
-    all_t = back+degen+lay+place
+    multi = [t for t in tips if t["type"]=="MULTI"]
+    all_t = back+place+multi
     total_u  = sum(t.get("units",0) for t in all_t)
-    avg_odds = (sum(t.get("real_odds",0) for t in all_t)/len(all_t)) if all_t else 0
-    avg_win  = (sum(t.get("win_pct",0) for t in all_t)/len(all_t)) if all_t else 0
-    tracks   = ", ".join(sorted({t.get("track","") for t in all_t if t.get("track")})) or "—"
+    # Multis don't carry a single-runner win_pct/real_odds — those averages
+    # are only meaningful across the priced single-horse tips.
+    priced   = back+place
+    avg_odds = (sum(t.get("real_odds",0) for t in priced)/len(priced)) if priced else 0
+    avg_win  = (sum(t.get("win_pct",0) for t in priced)/len(priced)) if priced else 0
+    track_set = set()
+    for t in all_t:
+        if t.get("type")=="MULTI":
+            for l in (t.get("legs") or []):
+                if l.get("track"): track_set.add(l.get("track"))
+        elif t.get("track"):
+            track_set.add(t.get("track"))
+    tracks   = ", ".join(sorted(track_set)) or "—"
     t_races  = len(analyzer)
     t_run    = sum(len(r.get("horses",[])) for r in analyzer)
     pushed   = _pushed_str(store)
@@ -1351,9 +1446,8 @@ def _dash_body(store, friend=False):
         '<div class="content">'
         '<div class="summary" style="margin-bottom:10px;">'
         + _sc("tb", len(back),  "var(--green)", "Back")
-        + _sc("td", len(degen), "var(--warn)",  "Degen")
-        + _sc("tl", len(lay),   "var(--red)",   "Lay")
         + _sc("tp", len(place), "var(--acc)",   "Place")
+        + _sc("tm", len(multi), "var(--warn)",  "Multi")
         + '</div>'
         '<div class="stat-grid">'
         f'<div class="stat-card green"><div class="stat-label">Total Units</div><div class="stat-value">{total_u:.0f}u</div><div class="stat-sub">{len(all_t)} selections</div></div>'
@@ -1571,12 +1665,12 @@ def _settings_body():
     <label class="switch"><input type="checkbox" id="pref-enabled" onchange="onMasterToggle()"><span class="slider"></span></label>
   </div>
   <div class="settings-row">
-    <span>Degen bets</span>
-    <label class="switch"><input type="checkbox" id="pref-degen" checked onchange="savePrefsOnly()"><span class="slider"></span></label>
+    <span>Place bets</span>
+    <label class="switch"><input type="checkbox" id="pref-place" checked onchange="savePrefsOnly()"><span class="slider"></span></label>
   </div>
   <div class="settings-row">
-    <span>Lay bets</span>
-    <label class="switch"><input type="checkbox" id="pref-lay" checked onchange="savePrefsOnly()"><span class="slider"></span></label>
+    <span>Multi bets</span>
+    <label class="switch"><input type="checkbox" id="pref-multi" checked onchange="savePrefsOnly()"><span class="slider"></span></label>
   </div>
   <div class="settings-row">
     <span>Minutes before jump</span>
@@ -1604,8 +1698,8 @@ function _setStatus(msg){{ var el=document.getElementById('push-status'); if(el)
 function _currentPrefs(){{
   return {{
     enabled: document.getElementById('pref-enabled').checked,
-    degen: document.getElementById('pref-degen').checked,
-    lay: document.getElementById('pref-lay').checked,
+    place: document.getElementById('pref-place').checked,
+    multi: document.getElementById('pref-multi').checked,
     minutes_before: parseInt(document.getElementById('pref-minutes').value,10) || 5
   }};
 }}
@@ -1630,8 +1724,8 @@ async function loadPushSettings(){{
     var s=await r.json();
     if(s.subscribed){{
       document.getElementById('pref-enabled').checked=!!s.prefs.enabled;
-      document.getElementById('pref-degen').checked=!!s.prefs.degen;
-      document.getElementById('pref-lay').checked=!!s.prefs.lay;
+      document.getElementById('pref-place').checked=!!s.prefs.place;
+      document.getElementById('pref-multi').checked=!!s.prefs.multi;
       document.getElementById('pref-minutes').value=s.prefs.minutes_before||5;
       _setStatus('Enabled on this device.');
     }} else {{
