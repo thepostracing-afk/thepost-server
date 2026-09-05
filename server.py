@@ -6,7 +6,7 @@ from collections import OrderedDict
 from urllib.parse import quote
 import requests
 from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.concurrency import run_in_threadpool
@@ -173,7 +173,7 @@ async def serve_icon():
 
 @app.get("/manifest.json")
 async def manifest():
-    return JSONResponse({"name":"The Post","short_name":"The Post","description":"Racing Intelligence","start_url":"/","display":"standalone","background_color":"#0B0F14","theme_color":"#0B0F14","orientation":"portrait","icons":[{"src":"/icon.png","sizes":"512x512","type":"image/png"}]})
+    return JSONResponse({"name":"The Post","short_name":"The Post","description":"Racing Intelligence","start_url":"/dash","display":"standalone","background_color":"#0B0F14","theme_color":"#0B0F14","orientation":"portrait","icons":[{"src":"/icon.png","sizes":"512x512","type":"image/png"}]})
 
 # ---------------------------------------------------------------------------
 # Persistent storage via Upstash Redis REST API
@@ -322,7 +322,7 @@ async def _notify_tick():
                 "body": f'{horse_label} \u00b7 {ttype.title()} \u00b7 {int(t.get("units",1))}u',
                 "icon": icon,
                 "tag": tid,
-                "url": "/",
+                "url": "/tips",
             }
             try:
                 await run_in_threadpool(_send_push_sync, entry["subscription"], payload)
@@ -479,7 +479,7 @@ async def push_test(request: Request):
         "body": "Test notification \u2014 jump-time alerts are set up on this device.",
         "icon": "/icon.png",
         "tag": "thepost-test",
-        "url": "/",
+        "url": "/tips",
     }
     try:
         await run_in_threadpool(_send_push_sync, sub, payload)
@@ -900,9 +900,11 @@ input:checked + .slider:before{transform:translateX(18px);background:var(--green
 <div id="export-stage"></div>
 <nav class="navbar">
 """ + ("""  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/portal/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
+  <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/portal/tips'"><span class="ni">&#x1F3C7;</span>Tips</button>
   <button class="nbtn """ + ("active" if page_id=="watch" else "") + """ " onclick="location.href='/portal/watch'"><span class="ni">&#x1F4FA;</span>Watch</button>
   <button class="nbtn """ + ("active" if page_id=="settings" else "") + """ " onclick="location.href='/settings'"><span class="ni">&#x2699;&#xFE0F;</span>Settings</button>
 """ if friend else """  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
+  <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/tips'"><span class="ni">&#x1F3C7;</span>Tips</button>
   <button class="nbtn """ + ("active" if page_id=="analyzer" else "") + """ " onclick="location.href='/analyzer'"><span class="ni">&#x1F50D;</span>Analyzer</button>
   <button class="nbtn """ + ("active" if page_id=="watch" else "") + """ " onclick="location.href='/watch'"><span class="ni">&#x1F4FA;</span>Watch</button>
   <button class="nbtn """ + ("active" if page_id=="settings" else "") + """ " onclick="location.href='/settings'"><span class="ni">&#x2699;&#xFE0F;</span>Settings</button>
@@ -1346,10 +1348,19 @@ def _tips_body(store):
     )
 
 @app.get("/", response_class=HTMLResponse)
+async def home_redirect():
+    # The Dashboard is the app's landing page — Tips lives at /tips now.
+    return RedirectResponse(url="/dash")
+
+@app.get("/portal", response_class=HTMLResponse)
+async def portal_home_redirect():
+    return RedirectResponse(url="/portal/dash")
+
+@app.get("/tips", response_class=HTMLResponse)
 async def tips_page():
     return HTMLResponse(_cached_page("tips", lambda: _shell("tips", _tips_body(_store), _store)))
 
-@app.get("/portal", response_class=HTMLResponse)
+@app.get("/portal/tips", response_class=HTMLResponse)
 async def portal_tips_page():
     return HTMLResponse(_cached_page("portal_tips", lambda: _shell("tips", _tips_body(_store), _store, friend=True)))
 
@@ -1360,18 +1371,11 @@ def _dash_body(store, friend=False):
     place = [t for t in tips if t["type"]=="PLACE"]
     multi = [t for t in tips if t["type"]=="MULTI"]
     all_t = back+place+multi
-    total_u  = sum(t.get("units",0) for t in all_t)
     back_u   = sum(t.get("units",0) for t in back)
     place_u  = sum(t.get("units",0) for t in place)
     multi_u  = sum(t.get("units",0) for t in multi)
-    # Multis don't carry a single-runner win_pct/real_odds/rsi — those
-    # averages are only meaningful across the priced single-horse tips.
-    priced    = back+place
-    avg_odds  = (sum(t.get("real_odds",0) for t in priced)/len(priced)) if priced else 0
-    avg_win   = (sum(t.get("win_pct",0) for t in priced)/len(priced)) if priced else 0
-    avg_rsi   = (sum(t.get("rsi",0) for t in priced)/len(priced)) if priced else 0
-    top_plays = sum(1 for t in back if t.get("tag")=="TOP PLAY")
-    best      = max(priced, key=lambda t: t.get("value_pct",0), default=None)
+    total_u  = back_u+place_u+multi_u
+    best     = max(all_t, key=lambda t: t.get("units",0), default=None)
 
     track_set = set()
     for t in all_t:
@@ -1385,7 +1389,7 @@ def _dash_body(store, friend=False):
     t_run    = sum(len(r.get("horses",[])) for r in analyzer)
     pushed   = _pushed_str(store)
 
-    tips_base = "/portal" if friend else "/"
+    tips_base = "/portal/tips" if friend else "/tips"
 
     # Bet-type boxes are now the only route into Tips — clicking one jumps
     # straight to that tab. Each also shows its share of today's selections
@@ -1400,26 +1404,41 @@ def _dash_body(store, friend=False):
             f'<div class="sc-pct">{pct}% of tips</div></div>'
         )
 
-    # Best Value spotlight — the single highest-value priced selection today,
-    # surfaced up top since it's the one pick most worth a second look.
+    # Best Bet spotlight — whichever selection is carrying the most stake
+    # today, since that's the one the model is most confident in.
     spotlight_html = ""
     if best:
         b_type = best.get("type","")
-        type_color = "var(--green)" if b_type=="BACK" else "var(--acc)"
+        type_color = "var(--green)" if b_type=="BACK" else ("var(--acc)" if b_type=="PLACE" else "var(--warn)")
+        if b_type == "MULTI":
+            legs = best.get("legs") or []
+            leg_tracks = ", ".join(dict.fromkeys(l.get("track","") for l in legs if l.get("track")))
+            title_name = f'{len(legs)}-Leg Multi'
+            meta = f'{best.get("time","")} &middot; {leg_tracks}' if leg_tracks else best.get("time","")
+            stats_html = (
+                f'<div class="spot-item"><span class="hsl">ODDS</span><span class="hsv">${best.get("combined_odds",0):.2f}</span></div>'
+                f'<div class="spot-item"><span class="hsl">LEGS</span><span class="hsv">{len(legs)}</span></div>'
+                f'<div class="spot-item"><span class="hsl">AVG RSI</span><span class="hsv">{int(best.get("avg_rsi",0))}</span></div>'
+                f'<div class="spot-item"><span class="hsl">UNITS</span><span class="hsv">{int(best.get("units",1))}u</span></div>'
+            )
+        else:
+            title_name = best.get("horse","")
+            meta = f'{best.get("time","")} &middot; {best.get("track","")} &middot; {best.get("race","")}'
+            stats_html = (
+                f'<div class="spot-item"><span class="hsl">ODDS</span><span class="hsv">${best.get("real_odds",0):.2f}</span></div>'
+                f'<div class="spot-item"><span class="hsl">VALUE</span><span class="hsv pos">{best.get("value_pct",0):+.1f}%</span></div>'
+                f'<div class="spot-item"><span class="hsl">RSI</span><span class="hsv">{int(best.get("rsi",0))}</span></div>'
+                f'<div class="spot-item"><span class="hsl">UNITS</span><span class="hsv">{int(best.get("units",1))}u</span></div>'
+            )
         spotlight_html = (
             '<div class="card spotlight-card" style="margin-bottom:9px;">'
-            '<div class="stat-label" style="margin-bottom:6px;">&#x2B50; Best Value Today</div>'
+            '<div class="stat-label" style="margin-bottom:6px;">&#x2B50; Best Bet</div>'
             '<div class="spot-top">'
-            f'<div class="spot-horse">{best.get("horse","")}</div>'
+            f'<div class="spot-horse">{title_name}</div>'
             f'<span class="tag" style="background:transparent;border:1px solid {type_color};color:{type_color};">{b_type}</span>'
             '</div>'
-            f'<div class="spot-meta">{best.get("time","")} &middot; {best.get("track","")} &middot; {best.get("race","")}</div>'
-            '<div class="spot-stats">'
-            f'<div class="spot-item"><span class="hsl">ODDS</span><span class="hsv">${best.get("real_odds",0):.2f}</span></div>'
-            f'<div class="spot-item"><span class="hsl">VALUE</span><span class="hsv pos">{best.get("value_pct",0):+.1f}%</span></div>'
-            f'<div class="spot-item"><span class="hsl">RSI</span><span class="hsv">{int(best.get("rsi",0))}</span></div>'
-            f'<div class="spot-item"><span class="hsl">WIN%</span><span class="hsv">{best.get("win_pct",0):.1f}%</span></div>'
-            '</div>'
+            f'<div class="spot-meta">{meta}</div>'
+            f'<div class="spot-stats">{stats_html}</div>'
             '</div>'
         )
 
@@ -1520,14 +1539,8 @@ def _dash_body(store, friend=False):
         + _sc("tp", len(place), "var(--acc)",   "Place")
         + _sc("tm", len(multi), "var(--warn)",  "Multi")
         + '</div>'
-        + spotlight_html +
-        '<div class="stat-grid">'
-        f'<div class="stat-card green"><div class="stat-label">Total Units</div><div class="stat-value">{total_u:.0f}u</div><div class="stat-sub">{len(all_t)} selections</div></div>'
-        f'<div class="stat-card warn"><div class="stat-label">Avg Odds</div><div class="stat-value">${avg_odds:.2f}</div><div class="stat-sub">Avg win {avg_win:.1f}%</div></div>'
-        f'<div class="stat-card"><div class="stat-label">Avg RSI</div><div class="stat-value">{avg_rsi:.0f}</div><div class="stat-sub">Back + Place</div></div>'
-        f'<div class="stat-card green"><div class="stat-label">Top Plays</div><div class="stat-value">{top_plays}</div><div class="stat-sub">of {len(back)} back bets</div></div>'
-        f'<div class="stat-card green" style="grid-column:1/-1;"><div class="stat-label">Races Loaded</div><div class="stat-value">{t_races}</div><div class="stat-sub">{t_run} runners</div></div>'
-        '</div>'
+        + spotlight_html
+        + f'<div class="card stat-card green" style="margin-bottom:9px;"><div class="stat-label">Races Loaded</div><div class="stat-value">{t_races}</div><div class="stat-sub">{t_run} runners</div></div>'
         + type_bar_html
         + next_html +
         f'<div class="card" style="margin-bottom:9px;"><div class="stat-label" style="margin-bottom:8px;">Tracks Today</div><div style="font-size:13px;line-height:1.6;">{tracks}</div></div>'
