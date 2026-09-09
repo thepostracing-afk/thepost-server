@@ -1211,7 +1211,7 @@ function _runExportPhoto(){
 </script>
 </body></html>"""
 
-def _cards_js(tips_list, label, container_id):
+def _cards_js(tips_list, label, container_id, odds_label="ODDS"):
     if not tips_list:
         return f'<p class="empty">No {label} picks yet</p>'
     out = f'<div id="{container_id}">'
@@ -1235,7 +1235,7 @@ def _cards_js(tips_list, label, container_id):
             f'<div class="ctop"><span class="horse-row">{_silk_html(_get_silk_url(t))}<span class="horse">{t.get("horse","")}</span></span>{tag_html}</div>'
             f'<div class="meta">{t.get("time","")} &middot; {t.get("track","")} &middot; {t.get("race","")}</div>'
             f'<div class="stats">'
-            f'<div class="stat"><span class="sl">ODDS</span><span class="sv">${t.get("real_odds",0):.2f}</span></div>'
+            f'<div class="stat"><span class="sl">{odds_label}</span><span class="sv">${t.get("real_odds",0):.2f}</span></div>'
             f'<div class="stat"><span class="sl">UNITS</span><span class="sv">{int(t.get("units",1))}u</span></div>'
             f'<div class="stat"><span class="sl">VALUE</span><span class="sv {vc}">{t.get("value_pct",0):+.1f}%</span></div>'
             f'<div class="stat"><span class="sl">RSI</span><span class="sv">{int(t.get("rsi",0))}</span></div>'
@@ -1338,7 +1338,7 @@ def _tips_body(store):
         f'<div class="sc"><div class="sn" style="color:var(--warn)">{len(multi)}</div><div class="sl2">Multi</div></div>'
         '</div>'
         f'<div class="section active" id="tb" data-grp="tips">{_cards_js(back,"back","cards-container")}</div>'
-        f'<div class="section" id="tp" data-grp="tips">{_cards_js(place,"place","cards-container-p")}</div>'
+        f'<div class="section" id="tp" data-grp="tips">{_cards_js(place,"place","cards-container-p",odds_label="PLACE ODDS")}</div>'
         f'<div class="section" id="tm" data-grp="tips">{_cards_multi_js(multi)}</div>'
         '</div>'
         '<script>'
@@ -1427,8 +1427,9 @@ def _dash_body(store, friend=False):
         else:
             title_name = best.get("horse","")
             meta = f'{best.get("time","")} &middot; {best.get("track","")} &middot; {best.get("race","")}'
+            odds_lbl = "PLACE ODDS" if b_type == "PLACE" else "ODDS"
             stats_html = (
-                f'<div class="spot-item"><span class="hsl">ODDS</span><span class="hsv">${best.get("real_odds",0):.2f}</span></div>'
+                f'<div class="spot-item"><span class="hsl">{odds_lbl}</span><span class="hsv">${best.get("real_odds",0):.2f}</span></div>'
                 f'<div class="spot-item"><span class="hsl">VALUE</span><span class="hsv pos">{best.get("value_pct",0):+.1f}%</span></div>'
                 f'<div class="spot-item"><span class="hsl">RSI</span><span class="hsv">{int(best.get("rsi",0))}</span></div>'
                 f'<div class="spot-item"><span class="hsl">UNITS</span><span class="hsv">{int(best.get("units",1))}u</span></div>'
