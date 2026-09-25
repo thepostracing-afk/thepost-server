@@ -35,6 +35,12 @@ _PUSH_READY = _PUSH_LIB_AVAILABLE and bool(VAPID_PRIVATE_KEY and VAPID_PUBLIC_KE
 
 PUSH_API_KEY = os.environ.get("PUSH_API_KEY", "thepost2026")
 
+# Password gate for editing P&L directly from the web app (add/edit/delete
+# a result). Deliberately simple — this is a single-user tool, not a
+# multi-tenant auth system — checked server-side on every write so a
+# client bypassing the JS prompt still can't write without it.
+PNL_EDIT_PASSWORD = os.environ.get("PNL_EDIT_PASSWORD", "1017")
+
 UPSTASH_URL   = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 STORE_KEY     = "thepost_store"
@@ -327,6 +333,78 @@ async def push_pnl(request: Request, x_api_key: str = Header(default="")):
         _store["push_count"] += 1
         await run_in_threadpool(_save, _store)
     return {"status":"ok","pnl_records":len(_store["pnl"])}
+
+@app.post("/api/pnl/add")
+async def pnl_add(request: Request):
+    """Add one P&L result directly from the web app (password-gated —
+    only the main /dash surface exposes the UI for this, but the server
+    checks the password regardless of caller)."""
+    try: body = await request.json()
+    except: raise HTTPException(status_code=400, detail="Invalid JSON")
+    if body.get("password") != PNL_EDIT_PASSWORD:
+        raise HTTPException(status_code=403, detail="Wrong password")
+    rec = {
+        "date":       datetime.date.today().isoformat(),
+        "type":       str(body.get("type","BACK") or "BACK").upper(),
+        "race":       body.get("race",""),
+        "horse":      body.get("horse",""),
+        "track":      body.get("track",""),
+        "units":      float(body.get("units",0) or 0),
+        "real_odds":  float(body.get("real_odds",0) or 0),
+        "result":     str(body.get("result","WIN") or "WIN").upper(),
+        "pnl_units":  float(body.get("pnl_units",0) or 0),
+    }
+    async with _push_lock:
+        _store.setdefault("pnl", []).append(rec)
+        _store["push_count"] += 1
+        await run_in_threadpool(_save, _store)
+    return {"status": "ok", "pnl_records": len(_store["pnl"])}
+
+@app.post("/api/pnl/edit")
+async def pnl_edit(request: Request):
+    try: body = await request.json()
+    except: raise HTTPException(status_code=400, detail="Invalid JSON")
+    if body.get("password") != PNL_EDIT_PASSWORD:
+        raise HTTPException(status_code=403, detail="Wrong password")
+    async with _push_lock:
+        pnl = _store.setdefault("pnl", [])
+        try:
+            idx = int(body.get("index"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid index")
+        if not (0 <= idx < len(pnl)):
+            raise HTTPException(status_code=400, detail="Invalid index")
+        rec = pnl[idx]
+        for k in ("race", "horse", "track"):
+            if k in body: rec[k] = body[k]
+        for k in ("type", "result"):
+            if k in body: rec[k] = str(body[k]).upper()
+        for k in ("units", "real_odds", "pnl_units"):
+            if k in body:
+                try: rec[k] = float(body[k])
+                except (TypeError, ValueError): pass
+        _store["push_count"] += 1
+        await run_in_threadpool(_save, _store)
+    return {"status": "ok"}
+
+@app.post("/api/pnl/delete")
+async def pnl_delete(request: Request):
+    try: body = await request.json()
+    except: raise HTTPException(status_code=400, detail="Invalid JSON")
+    if body.get("password") != PNL_EDIT_PASSWORD:
+        raise HTTPException(status_code=403, detail="Wrong password")
+    async with _push_lock:
+        pnl = _store.setdefault("pnl", [])
+        try:
+            idx = int(body.get("index"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid index")
+        if not (0 <= idx < len(pnl)):
+            raise HTTPException(status_code=400, detail="Invalid index")
+        pnl.pop(idx)
+        _store["push_count"] += 1
+        await run_in_threadpool(_save, _store)
+    return {"status": "ok", "pnl_records": len(_store["pnl"])}
 
 @app.get("/api/tips")
 async def api_tips():
@@ -908,6 +986,83 @@ function sortAnalyzer(key,btn){
   blocks.forEach(function(b){c.appendChild(b);});
 }
 
+// ---------------------------------------------------------------------------
+// P&L edit (Add/Edit/Delete a result) — password-gated, main /dash only.
+// The password is asked once per browser tab (sessionStorage) and sent with
+// every write; the server is the real gate (see /api/pnl/*), this is just
+// so you're not typing it on every single edit.
+// ---------------------------------------------------------------------------
+function _pnlPw(){
+  var pw=sessionStorage.getItem('thepost_pnl_pw');
+  if(!pw){
+    pw=prompt('Enter password to edit P&L:');
+    if(pw) sessionStorage.setItem('thepost_pnl_pw',pw);
+  }
+  return pw;
+}
+function _pnlPost(url,body){
+  return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(function(r){
+      if(r.status===403){
+        sessionStorage.removeItem('thepost_pnl_pw');
+        alert('Wrong password.');
+        return null;
+      }
+      if(!r.ok){ alert('Something went wrong — please try again.'); return null; }
+      return r.json();
+    }).catch(function(){ alert('Network error — please try again.'); return null; });
+}
+function pnlAdd(){
+  var pw=_pnlPw();
+  if(!pw) return;
+  var horse=prompt('Horse name:');
+  if(!horse) return;
+  var track=prompt('Track (optional):','')||'';
+  var type=(prompt('Type (BACK / LAY / DEGEN / PLACE / MULTI):','BACK')||'BACK').toUpperCase();
+  var units=parseFloat(prompt('Units staked:','1'));
+  if(isNaN(units)) units=1;
+  var result=(prompt('Result (WIN / LOSS):','WIN')||'WIN').toUpperCase();
+  var odds=parseFloat(prompt('Odds (decimal, optional — leave 0 to enter net units directly):','0'));
+  if(isNaN(odds)) odds=0;
+  var pnl;
+  if(result==='WIN'){
+    if(odds>0){ pnl=units*(odds-1); }
+    else { pnl=parseFloat(prompt('Units won (e.g. 3.5):','0'))||0; }
+  } else {
+    pnl=-units;
+  }
+  _pnlPost('/api/pnl/add',{password:pw,horse:horse,track:track,type:type,units:units,real_odds:odds,result:result,pnl_units:pnl})
+    .then(function(res){ if(res) location.reload(); });
+}
+function pnlEditRow(btn){
+  var row=btn.closest('.pnl-row');
+  var idx=parseInt(row.dataset.index,10);
+  var pw=_pnlPw();
+  if(!pw) return;
+  var horse=prompt('Horse name:',row.dataset.horse);
+  if(horse===null) return;
+  var track=prompt('Track:',row.dataset.track);
+  if(track===null) return;
+  var type=prompt('Type:',row.dataset.type);
+  if(type===null) return;
+  var units=parseFloat(prompt('Units staked:',row.dataset.units));
+  if(isNaN(units)) return;
+  var result=(prompt('Result (WIN / LOSS):',row.dataset.result)||row.dataset.result).toUpperCase();
+  var pnl=parseFloat(prompt('Net units (+ for win, - for loss):',row.dataset.pnl));
+  if(isNaN(pnl)) return;
+  _pnlPost('/api/pnl/edit',{password:pw,index:idx,horse:horse,track:track,type:type,units:units,result:result,pnl_units:pnl})
+    .then(function(res){ if(res) location.reload(); });
+}
+function pnlDeleteRow(btn){
+  var row=btn.closest('.pnl-row');
+  var idx=parseInt(row.dataset.index,10);
+  var pw=_pnlPw();
+  if(!pw) return;
+  if(!confirm('Delete this result?')) return;
+  _pnlPost('/api/pnl/delete',{password:pw,index:idx})
+    .then(function(res){ if(res) location.reload(); });
+}
+
 var _logoCutoutCache=null;
 function _isIOS(){
   return /iP(hone|od|ad)/.test(navigator.userAgent) ||
@@ -1241,30 +1396,71 @@ async def tips_page():
 async def portal_tips_page():
     return HTMLResponse(_cached_page("portal_tips", lambda: _shell("tips", _tips_body(_store), _store, friend=True)))
 
-def _pnl_card_html(store):
+def _attr_esc(s):
+    """Minimal HTML-attribute escaping for values we embed in data-* attrs
+    (P&L edit rows) — avoids a broken attribute if a horse/track name ever
+    contains a quote."""
+    return (str(s or "")
+            .replace("&", "&amp;").replace('"', "&quot;")
+            .replace("'", "&#39;").replace("<", "&lt;").replace(">", "&gt;"))
+
+def _pnl_card_html(store, editable=False):
     """Today's marked results — wins, losses, and net units, plus a
     per-result list (horse, track, bet type, and the units won/lost on
-    that one). Renders nothing if nothing's been marked yet today."""
+    that one). Renders nothing if nothing's been marked yet today.
+    When editable=True (main /dash only, not the friend portal), adds an
+    Add/Edit/Delete UI gated by PNL_EDIT_PASSWORD server-side."""
     records = store.get("pnl", [])
+    add_btn = '<button class="sbtn" style="margin-bottom:8px;" onclick="pnlAdd()">+ Add Result</button>' if editable else ""
     if not records:
-        return ""
+        if not editable:
+            return ""
+        return (
+            '<div class="card" style="margin-bottom:9px;">'
+            '<div class="stat-label" style="margin-bottom:8px;">Today&#8217;s P&amp;L</div>'
+            + add_btn +
+            '<p class="empty" style="padding:6px 0;">No results marked yet today</p>'
+            '</div>'
+        )
     wins   = sum(1 for r in records if str(r.get("result","")).upper() == "WIN")
     losses = sum(1 for r in records if str(r.get("result","")).upper() != "WIN")
     net    = sum(float(r.get("pnl_units", 0) or 0) for r in records)
     net_color = "var(--green)" if net > 0 else ("var(--red)" if net < 0 else "var(--t2)")
 
     rows = ""
-    for r in reversed(records):  # most recent result first
+    for idx, r in reversed(list(enumerate(records))):  # most recent result first
         is_win = str(r.get("result","")).upper() == "WIN"
         rc = "var(--green)" if is_win else "var(--red)"
         pnl_val = float(r.get("pnl_units", 0) or 0)
-        sub = " &middot; ".join(x for x in [r.get("track",""), r.get("type","")] if x)
+        horse = r.get("horse","")
+        track = r.get("track","")
+        btype = r.get("type","")
+        units = float(r.get("units", 0) or 0)
+        odds  = float(r.get("real_odds", 0) or 0)
+        result = str(r.get("result","")).upper()
+        sub = " &middot; ".join(x for x in [track, btype] if x)
+        edit_buttons = ""
+        if editable:
+            edit_buttons = (
+                '<span class="pnl-edit-btn" style="cursor:pointer;color:var(--t2);font-size:13px;padding:2px;" onclick="pnlEditRow(this)">&#9998;</span>'
+                '<span class="pnl-del-btn" style="cursor:pointer;color:var(--red);font-size:14px;padding:2px;" onclick="pnlDeleteRow(this)">&#10005;</span>'
+            )
+        row_attrs = ""
+        if editable:
+            row_attrs = (
+                f' data-index="{idx}" data-horse="{_attr_esc(horse)}" data-track="{_attr_esc(track)}"'
+                f' data-type="{_attr_esc(btype)}" data-units="{units}" data-odds="{odds}"'
+                f' data-result="{_attr_esc(result)}" data-pnl="{pnl_val}"'
+            )
         rows += (
-            '<div class="nr-row">'
-            f'<span class="nr-name">{r.get("horse","")}'
+            f'<div class="nr-row pnl-row"{row_attrs}>'
+            f'<span class="nr-name">{horse}'
             + (f'<br><span style="font-size:9.5px;color:var(--t2);">{sub}</span>' if sub else '')
             + '</span>'
+            '<span style="display:flex;align-items:center;gap:8px;">'
             f'<span style="font-weight:700;color:{rc};white-space:nowrap;">{pnl_val:+.2f}u</span>'
+            + edit_buttons +
+            '</span>'
             '</div>'
         )
 
@@ -1276,6 +1472,7 @@ def _pnl_card_html(store):
         f'<div class="spot-item"><span class="hsl">LOSSES</span><span class="hsv" style="color:var(--red);">{losses}</span></div>'
         f'<div class="spot-item"><span class="hsl">NET UNITS</span><span class="hsv" style="color:{net_color};">{net:+.2f}u</span></div>'
         '</div>'
+        + add_btn +
         f'{rows}'
         '</div>'
     )
@@ -1444,7 +1641,7 @@ def _dash_body(store, friend=False):
         + _sc("tm", len(multi), "var(--warn)",  "Multi")
         + '</div>'
         + spotlight_html
-        + _pnl_card_html(store)
+        + _pnl_card_html(store, editable=not friend)
         + f'<div class="card stat-card green" style="margin-bottom:9px;"><div class="stat-label">Races Loaded</div><div class="stat-value">{t_races}</div><div class="stat-sub">{t_run} runners</div></div>'
         + type_bar_html
         + next_html +
