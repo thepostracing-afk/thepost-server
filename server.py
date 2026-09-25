@@ -39,7 +39,7 @@ UPSTASH_URL   = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 STORE_KEY     = "thepost_store"
 
-DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "last_push": None, "push_count": 0, "push_subs": {}}
+DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "pnl": [], "last_push": None, "push_count": 0, "push_subs": {}}
 
 app = FastAPI(title="The Post", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -162,6 +162,7 @@ def _save(s):
 
 _store = _load()
 _store.setdefault("push_subs", {})
+_store.setdefault("pnl", [])
 _push_lock = asyncio.Lock()
 
 _page_cache = {}
@@ -310,6 +311,22 @@ async def push(request: Request, x_api_key: str = Header(default="")):
         _store["push_count"] += 1
         await run_in_threadpool(_save, _store)
     return {"status":"ok","tips":len(_store["tips"]),"analyzer_races":len(_store["analyzer"]),"live_races":len(_store["live"])}
+
+@app.post("/push/pnl")
+async def push_pnl(request: Request, x_api_key: str = Header(default="")):
+    """Receives today's marked win/loss results from the desktop app. The
+    desktop app always sends its full current list for today (not just the
+    newest record), so this just replaces _store["pnl"] wholesale — same
+    pattern as /push for tips, and it means the list naturally resets once
+    the desktop app starts sending a new day's records."""
+    if x_api_key != PUSH_API_KEY: raise HTTPException(status_code=401,detail="Invalid API key")
+    try: body = await request.json()
+    except: raise HTTPException(status_code=400,detail="Invalid JSON")
+    async with _push_lock:
+        _store["pnl"] = body.get("pnl", [])
+        _store["push_count"] += 1
+        await run_in_threadpool(_save, _store)
+    return {"status":"ok","pnl_records":len(_store["pnl"])}
 
 @app.get("/api/tips")
 async def api_tips():
@@ -1224,6 +1241,45 @@ async def tips_page():
 async def portal_tips_page():
     return HTMLResponse(_cached_page("portal_tips", lambda: _shell("tips", _tips_body(_store), _store, friend=True)))
 
+def _pnl_card_html(store):
+    """Today's marked results — wins, losses, and net units, plus a
+    per-result list (horse, track, bet type, and the units won/lost on
+    that one). Renders nothing if nothing's been marked yet today."""
+    records = store.get("pnl", [])
+    if not records:
+        return ""
+    wins   = sum(1 for r in records if str(r.get("result","")).upper() == "WIN")
+    losses = sum(1 for r in records if str(r.get("result","")).upper() != "WIN")
+    net    = sum(float(r.get("pnl_units", 0) or 0) for r in records)
+    net_color = "var(--green)" if net > 0 else ("var(--red)" if net < 0 else "var(--t2)")
+
+    rows = ""
+    for r in reversed(records):  # most recent result first
+        is_win = str(r.get("result","")).upper() == "WIN"
+        rc = "var(--green)" if is_win else "var(--red)"
+        pnl_val = float(r.get("pnl_units", 0) or 0)
+        sub = " &middot; ".join(x for x in [r.get("track",""), r.get("type","")] if x)
+        rows += (
+            '<div class="nr-row">'
+            f'<span class="nr-name">{r.get("horse","")}'
+            + (f'<br><span style="font-size:9.5px;color:var(--t2);">{sub}</span>' if sub else '')
+            + '</span>'
+            f'<span style="font-weight:700;color:{rc};white-space:nowrap;">{pnl_val:+.2f}u</span>'
+            '</div>'
+        )
+
+    return (
+        '<div class="card" style="margin-bottom:9px;">'
+        '<div class="stat-label" style="margin-bottom:8px;">Today&#8217;s P&amp;L</div>'
+        '<div class="spot-stats" style="grid-template-columns:repeat(3,1fr);margin-bottom:6px;">'
+        f'<div class="spot-item"><span class="hsl">WINS</span><span class="hsv" style="color:var(--green);">{wins}</span></div>'
+        f'<div class="spot-item"><span class="hsl">LOSSES</span><span class="hsv" style="color:var(--red);">{losses}</span></div>'
+        f'<div class="spot-item"><span class="hsl">NET UNITS</span><span class="hsv" style="color:{net_color};">{net:+.2f}u</span></div>'
+        '</div>'
+        f'{rows}'
+        '</div>'
+    )
+
 def _dash_body(store, friend=False):
     tips     = store["tips"]
     analyzer = store["analyzer"]
@@ -1388,6 +1444,7 @@ def _dash_body(store, friend=False):
         + _sc("tm", len(multi), "var(--warn)",  "Multi")
         + '</div>'
         + spotlight_html
+        + _pnl_card_html(store)
         + f'<div class="card stat-card green" style="margin-bottom:9px;"><div class="stat-label">Races Loaded</div><div class="stat-value">{t_races}</div><div class="stat-sub">{t_run} runners</div></div>'
         + type_bar_html
         + next_html +
@@ -1538,10 +1595,11 @@ def _watch_body():
     multi = len(STREAM_SOURCES) > 1
     tabs_html = ""
     if multi:
-        tabs_html = '<div class="tabs">' + "".join(
+        tabs_html = '<div class="tabs" style="align-items:center;">' + "".join(
             f'<button class="tab{" active" if i==0 else ""}" data-tab="watch" '
+            f'style="padding:10px 4px;display:flex;align-items:center;justify-content:center;" '
             f'onclick="switchWatch(\'{s["id"]}\',this)">'
-            + (f'<img src="{s["icon"]}" alt="{s["label"]}" style="height:16px;vertical-align:middle;">' if s.get("icon") else s["label"])
+            + (f'<img src="{s["icon"]}" alt="{s["label"]}" style="height:34px;max-width:100px;object-fit:contain;display:block;">' if s.get("icon") else s["label"])
             + '</button>'
             for i, s in enumerate(STREAM_SOURCES)
         ) + '</div>'
