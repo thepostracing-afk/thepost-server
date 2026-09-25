@@ -15,9 +15,6 @@ try:
     from pywebpush import webpush, WebPushException
     _PUSH_LIB_AVAILABLE = True
 except ImportError:
-    # Lets the whole app boot even if `pywebpush` hasn't been deployed yet —
-    # jump-time notifications just stay off instead of taking the tips
-    # server down. Add `pywebpush` to requirements.txt to enable them.
     _PUSH_LIB_AVAILABLE = False
     class WebPushException(Exception):
         pass
@@ -28,22 +25,16 @@ try:
     from zoneinfo import ZoneInfo
     NOTIFY_TZ = ZoneInfo("Australia/Melbourne")
 except Exception:
-    # Falls back to fixed AEST (no daylight saving) if the system/tzdata
-    # package isn't available — add `tzdata` to requirements.txt to avoid this.
     NOTIFY_TZ = datetime.timezone(datetime.timedelta(hours=10))
 
-# --- Web Push / VAPID config (jump-time notifications) ---
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "").strip() or "mailto:admin@example.com"
 NOTIFY_TYPES = ("BACK", "PLACE", "MULTI")
-# Single source of truth for "can we actually send a push right now" — the
-# library has to be installed AND both VAPID keys have to be set.
 _PUSH_READY = _PUSH_LIB_AVAILABLE and bool(VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY)
 
 PUSH_API_KEY = os.environ.get("PUSH_API_KEY", "thepost2026")
 
-# --- Upstash Redis REST config ---
 UPSTASH_URL   = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 STORE_KEY     = "thepost_store"
@@ -52,21 +43,15 @@ DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "last_push": None, "pus
 
 app = FastAPI(title="The Post", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-# Compresses HTML/JSON responses in transit — meaningfully smaller payloads
-# on mobile data for basically no CPU cost at this traffic scale.
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 ICON_PATH = os.path.join(os.path.dirname(__file__), "thepost.png")
 
-# ---------------------------------------------------------------------------
-# Silk images — single shared component used by both the Tips cards and the
-# Analyzer tables, so silks look and behave identically everywhere.
-# ---------------------------------------------------------------------------
-SILK_SIZE      = 22   # px — identical size used in every location, tuned for the slimline mobile cards
+SILK_SIZE      = 22
 SILK_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "silk_cache")
 os.makedirs(SILK_CACHE_DIR, exist_ok=True)
-SILK_MEM_CACHE_MAX = 500  # cap in-process entries so a long-running dyno can't grow this unbounded
-_silk_mem_cache = OrderedDict()   # sha1(url) -> (content_type, bytes) — hot in-process cache
+SILK_MEM_CACHE_MAX = 500
+_silk_mem_cache = OrderedDict()
 
 def _silk_mem_cache_put(key, value):
     _silk_mem_cache[key] = value
@@ -75,9 +60,6 @@ def _silk_mem_cache_put(key, value):
         _silk_mem_cache.popitem(last=False)
 
 def _get_silk_url(d):
-    """Pull whatever silk URL field is present on a tip/horse dict, trying
-    every naming convention the desktop client might push (never generated,
-    never substituted — only ever the real asset's own URL)."""
     return (
         d.get("silk_url") or d.get("SilkURL")
         or d.get("silk")     or d.get("Silk")
@@ -85,9 +67,6 @@ def _get_silk_url(d):
     ).strip()
 
 def _get_horse_number(d):
-    """Pull whatever saddlecloth/runner-number field is present on a tip
-    dict, trying every naming convention the desktop client might push.
-    Returns '' (never a guess) if nothing is there."""
     for k in ("number", "horse_number", "saddlecloth", "saddlecloth_number",
               "runner_number", "tab_number", "program_number"):
         v = d.get(k)
@@ -96,16 +75,8 @@ def _get_horse_number(d):
     return ""
 
 def _silk_html(url, size=SILK_SIZE):
-    """Render the shared silk component. If no silk is available, render an
-    identically-sized blank slot instead — never a placeholder icon, never a
-    different image."""
     if not url:
         return f'<span class="silk-wrap" style="width:{size}px;height:{size}px;"></span>'
-    # The desktop app now embeds the silk directly as a base64 data: URI
-    # (it resolves the local silk file or CDN URL itself, so the browser
-    # never has to fetch anything). Only route through the /silk network
-    # proxy for a genuine remote URL — a data: URI can't be fetched by
-    # requests.get() and should just be used as-is.
     src = url if url.startswith("data:") else f"/silk?u={quote(url, safe='')}"
     return (
         f'<span class="silk-wrap" style="width:{size}px;height:{size}px;">'
@@ -116,12 +87,6 @@ def _silk_html(url, size=SILK_SIZE):
     )
 
 def _fetch_silk_sync(u, disk_path, ext):
-    """All the blocking work for a cache-miss silk (disk read/write + the
-    remote HTTP fetch). Always called via run_in_threadpool so a slow or
-    stalled silk host blocks one worker thread, never the whole event loop —
-    previously this ran directly inside the async route, which meant every
-    other request on the server (tips, dashboard, API calls, other silks)
-    stalled behind it, sometimes for the full 5s timeout."""
     if os.path.exists(disk_path):
         with open(disk_path, "rb") as f:
             data = f.read()
@@ -139,11 +104,6 @@ def _fetch_silk_sync(u, disk_path, ext):
 
 @app.get("/silk")
 async def silk_proxy(u: str = ""):
-    """Fetch-once, cache-forever proxy for a horse's real silk image. Serves
-    from an in-memory cache first, then an on-disk cache, and only ever
-    downloads a given silk URL once. Never generates or substitutes an image —
-    if the fetch fails, the caller gets a 404 and the front-end leaves the
-    slot blank."""
     if not u:
         raise HTTPException(status_code=404, detail="no silk")
     key = hashlib.sha1(u.encode("utf-8")).hexdigest()
@@ -175,15 +135,10 @@ async def serve_icon():
 async def manifest():
     return JSONResponse({"name":"The Post","short_name":"The Post","description":"Racing Intelligence","start_url":"/dash","display":"standalone","background_color":"#0B0F14","theme_color":"#0B0F14","orientation":"portrait","icons":[{"src":"/icon.png","sizes":"512x512","type":"image/png"}]})
 
-# ---------------------------------------------------------------------------
-# Persistent storage via Upstash Redis REST API
-# ---------------------------------------------------------------------------
-
 def _headers():
     return {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
 
 def _load():
-    """Fetch the store JSON from Upstash. Falls back to defaults on any error."""
     if not UPSTASH_URL or not UPSTASH_TOKEN:
         return dict(DEFAULT_STORE)
     try:
@@ -197,30 +152,18 @@ def _load():
         return dict(DEFAULT_STORE)
 
 def _save(s):
-    """Write the store JSON to Upstash."""
     if not UPSTASH_URL or not UPSTASH_TOKEN:
         return
     try:
         payload = json.dumps(s)
-        # Upstash REST SET: POST /set/<key> with raw value as body
         requests.post(f"{UPSTASH_URL}/set/{STORE_KEY}", headers=_headers(), data=payload, timeout=5)
     except Exception:
         pass
 
-# _store is the single in-memory source of truth for every GET route below.
-# /push is the only writer, and it keeps _store and Upstash in lockstep, so
-# there is no need to round-trip to Redis on every page view / API call just
-# to re-read data that hasn't changed — that round trip was previously the
-# single biggest source of per-request latency in this app.
 _store = _load()
-_store.setdefault("push_subs", {})  # older persisted stores may predate this key
+_store.setdefault("push_subs", {})
 _push_lock = asyncio.Lock()
 
-# Rendered-HTML cache, keyed by page. Invalidated purely by push_count, which
-# only ever changes inside /push — so this is a safe signal that "the data
-# behind this page changed" and lets us skip rebuilding ~unchanged markup
-# (string-building + f-string formatting over every tip/race/horse) on every
-# single request.
 _page_cache = {}
 
 def _cached_page(key, build_fn):
@@ -232,10 +175,7 @@ def _cached_page(key, build_fn):
     _page_cache[key] = (pc, html)
     return html
 
-# ---------------------------------------------------------------------------
-# Jump-time push notifications — BACK/PLACE/MULTI tips only, Saturdays only.
-# ---------------------------------------------------------------------------
-_notified = set()  # (sub_key, tip_id) already sent this run — in-memory only
+_notified = set()
 
 def _sub_key(endpoint):
     return hashlib.sha1((endpoint or "").encode("utf-8")).hexdigest()[:16]
@@ -252,9 +192,6 @@ def _tip_id(t):
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 def _jump_dt_today(time_str, now):
-    """Turn a race's raw time string into a concrete datetime for `now`'s
-    date, reusing the same AM/PM inference _time_key already uses elsewhere
-    so notification timing always matches what the Analyzer countdown shows."""
     minutes = _time_key(time_str)
     if minutes is None or minutes >= 99999:
         return None
@@ -273,9 +210,9 @@ def _send_push_sync(subscription, payload):
 
 async def _notify_tick():
     if not _PUSH_READY:
-        return  # push not configured (or pywebpush not installed) — nothing to do
+        return
     now = datetime.datetime.now(NOTIFY_TZ)
-    if now.weekday() != 5:  # Saturday only — hard rule, no exceptions
+    if now.weekday() != 5:
         return
     subs = list(_store.get("push_subs", {}).items())
     if not subs:
@@ -329,7 +266,6 @@ async def _notify_tick():
                 _notified.add(dedupe)
             except WebPushException as e:
                 if "410" in str(e) or "404" in str(e):
-                    # Subscription expired/revoked on the browser's end — drop it.
                     _store.get("push_subs", {}).pop(key, None)
                     await run_in_threadpool(_save, _store)
             except Exception:
@@ -337,9 +273,6 @@ async def _notify_tick():
 
 @app.on_event("startup")
 async def _start_background_sync():
-    """Belt-and-braces: re-pull from Upstash every 45s in the background so
-    the in-memory store self-heals if this process restarts elsewhere or
-    another instance pushes — without making every request pay for it."""
     async def _loop():
         while True:
             await asyncio.sleep(45)
@@ -355,9 +288,6 @@ async def _start_background_sync():
 
 @app.on_event("startup")
 async def _start_notify_loop():
-    """Checks every 20s whether any tip has crossed into its notification
-    window. Cheap (in-memory only) and safe to run often — the Saturday
-    check and per-tip dedupe happen inside _notify_tick()."""
     async def _loop():
         while True:
             await asyncio.sleep(20)
@@ -378,8 +308,6 @@ async def push(request: Request, x_api_key: str = Header(default="")):
         _store["live"]        = body.get("live",[])
         _store["last_push"]   = body.get("generated_at") or datetime.datetime.now().isoformat()
         _store["push_count"] += 1
-        # Offloaded to a thread so the Upstash write (a blocking `requests`
-        # call) never stalls the event loop that's serving everyone else.
         await run_in_threadpool(_save, _store)
     return {"status":"ok","tips":len(_store["tips"]),"analyzer_races":len(_store["analyzer"]),"live_races":len(_store["live"])}
 
@@ -394,10 +322,6 @@ async def api_analyzer():
 @app.get("/api/status")
 async def api_status():
     return {"last_push":_store["last_push"],"push_count":_store["push_count"],"tips":len(_store["tips"]),"analyzer_races":len(_store["analyzer"])}
-
-# ---------------------------------------------------------------------------
-# Push subscription management (Settings page)
-# ---------------------------------------------------------------------------
 
 def _default_prefs(overrides=None):
     p = {"enabled": True, "place": True, "multi": True, "minutes_before": 5}
@@ -516,8 +440,6 @@ self.addEventListener('notificationclick', function(event){
     return Response(js, media_type="application/javascript")
 
 def _stat_row(label, value, suffix=""):
-    """One label/value chip for the horse stat rundown. Returns '' if there's
-    nothing worth showing, so the grid only ever displays real data."""
     if value is None or value == "" :
         return ""
     try:
@@ -541,8 +463,6 @@ def _fmt_odds(v):
         return ""
 
 def _horse_detail_html(h):
-    """Full stat rundown for one horse — every field the desktop model tracks,
-    laid out as a compact grid. Missing/zero fields are simply omitted."""
     starts_line = ""
     cs, cw, cp = h.get("career_starts",""), h.get("career_wins",""), h.get("career_places","")
     if cs not in ("", 0, None):
@@ -611,17 +531,10 @@ def _pushed_str(store):
     except: return "Never"
 
 def _race_id(r):
-    """Stable id for a race, independent of list ordering/sort, so links can
-    point at a specific race regardless of which sort is applied server-side."""
     raw = f'{r.get("track","")}|{r.get("race","")}|{r.get("time","")}'
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
 
 def _time_key(tstr):
-    """Numeric sort key for race times.
-    Assumes:
-      - 11:xx and 12:xx are before 1 PM.
-      - 1:xx–10:xx are afternoon races (13:xx–22:xx) unless AM/PM is specified.
-    """
     try:
         t = str(tstr).strip().upper()
 
@@ -633,22 +546,15 @@ def _time_key(tstr):
         h = int(parts[0])
         m = int(parts[1][:2]) if len(parts) > 1 else 0
 
-        # Convert 1:00–10:59 to afternoon
         if 1 <= h <= 10:
             h += 12
 
-        # Leave 11:xx and 12:xx unchanged
         return h * 60 + m
 
     except Exception:
         return 99999.0
 
 def _poll_script(push_count, page_id):
-    """Replaces a blind full-page reload every 90s with a cheap status poll
-    every 20s (now nearly free since /api/status reads straight from
-    memory). Only reloads when push_count actually changed, and stashes
-    scroll position / active tab / open accordion rows first so a real
-    update doesn't feel like the page just kicked you back to the top."""
     if page_id == "watch":
         return ""
     return """
@@ -985,21 +891,12 @@ function sortAnalyzer(key,btn){
   blocks.forEach(function(b){c.appendChild(b);});
 }
 
-// ---------------------------------------------------------------------------
-// Export Photo — renders the current tab's tips into an offscreen replica of
-// the tips page (same cards, styling) but with the RSI and VALUE stats
-// stripped out of each card and the header swapped for the app logo, then
-// rasterizes it to a PNG the user can save or share.
-// ---------------------------------------------------------------------------
 var _logoCutoutCache=null;
 function _isIOS(){
   return /iP(hone|od|ad)/.test(navigator.userAgent) ||
     (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
 }
 function _isCanvasBlank(canvas){
-  // Safari's foreignObject render path occasionally succeeds but paints
-  // nothing (a known WebKit quirk) rather than throwing — sample a spread
-  // of pixels' alpha channel to catch that case so we can fall back.
   try{
     var ctx=canvas.getContext('2d');
     var d=ctx.getImageData(0,0,canvas.width,canvas.height).data;
@@ -1008,11 +905,6 @@ function _isCanvasBlank(canvas){
   }catch(e){ return false; }
 }
 function _seamlessLogo(){
-  // The source /icon.png is a solid-black square with a white mark on it.
-  // Rather than paste that black square onto the app's dark-navy (--bg)
-  // background — which leaves a visible seam — key the black out into real
-  // transparency (alpha = luminance) so the mark just floats on whatever's
-  // behind it, seamlessly, regardless of the exact background colour.
   if(_logoCutoutCache) return Promise.resolve(_logoCutoutCache);
   return new Promise(function(resolve){
     var img=new Image();
@@ -1041,9 +933,6 @@ function _seamlessLogo(){
 }
 
 function _loadHtml2Canvas(){
-  // Loaded on demand (only when Export is actually tapped) instead of on
-  // every single page view — dash/analyzer/watch never used it anyway, and
-  // this trims a non-trivial chunk of JS off every page's initial load.
   if(typeof html2canvas!=='undefined') return Promise.resolve();
   if(window._h2cLoadPromise) return window._h2cLoadPromise;
   window._h2cLoadPromise=new Promise(function(resolve,reject){
@@ -1070,9 +959,6 @@ function _runExportPhoto(){
   var clone=activeSection.cloneNode(true);
   clone.classList.add('active');
 
-  // Strip RSI + VALUE stat tiles from every card, then rebalance the grid.
-  // Silk images are kept — just forced to load eagerly so they're actually
-  // painted in by the time html2canvas rasterizes the page.
   clone.querySelectorAll('.card').forEach(function(card){
     card.querySelectorAll('.stat').forEach(function(s){
       var sl=s.querySelector('.sl');
@@ -1125,10 +1011,6 @@ function _runExportPhoto(){
   var exportChain=_seamlessLogo().then(function(logoSrc){
     logoImg.src=logoSrc;
 
-    // Wait for every image (logo + silks) to actually finish loading —
-    // cloned <img> tags don't carry over the "already loaded" state, so
-    // capturing immediately would rasterize blank slots. Each image gets a
-    // hard 3s cap so one stuck/broken image can't stall the whole export.
     var imgs=[].slice.call(page.querySelectorAll('img'));
     return Promise.all(imgs.map(function(img){
       if(img.complete && img.naturalWidth>0) return Promise.resolve();
@@ -1141,17 +1023,6 @@ function _runExportPhoto(){
       });
     }));
   }).then(function(){
-    // useCORS forces a fresh crossOrigin fetch even for images the browser
-    // already has cached (silks are inline data: URIs now anyway, and the
-    // logo/icon is same-origin) — dropping it avoids a redundant re-download.
-    //
-    // iOS Safari's canvas engine reconstructs every border-radius/box-shadow
-    // by hand in html2canvas's default renderer, which is dramatically
-    // slower than on Chrome/Android for card-heavy markup like this. Safari
-    // supports rendering via an SVG <foreignObject> instead, which lets
-    // WebKit's own (fast) native renderer do that work — so we try that
-    // first on iOS, with an automatic fallback to the default renderer if
-    // it comes back blank (a known occasional WebKit quirk).
     var bg=getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()||'#0B0F14';
     var iOS=_isIOS();
     var baseOpts={backgroundColor:bg,logging:false,imageTimeout:4000,scale:iOS?1.25:1.5};
@@ -1161,7 +1032,6 @@ function _runExportPhoto(){
       if(iOS && _isCanvasBlank(canvas)) return html2canvas(page,baseOpts);
       return canvas;
     }).catch(function(){
-      // foreignObjectRendering threw outright — standard renderer as fallback.
       return html2canvas(page,baseOpts);
     });
   }).then(function(canvas){
@@ -1173,9 +1043,6 @@ function _runExportPhoto(){
     });
   });
 
-  // Hard ceiling on the whole process — if anything upstream (a stuck
-  // image, an html2canvas edge case) never resolves, this fires anyway so
-  // the user gets an error and their UI back instead of a frozen toast.
   var watchdog=new Promise(function(_,reject){
     setTimeout(function(){ reject(new Error('export-timeout')); },22000);
   });
@@ -1218,8 +1085,6 @@ def _cards_js(tips_list, label, container_id, odds_label="ODDS"):
     for t in tips_list:
         tag_val = t.get("tag") or ""
         cls = tag_val.lower().replace(" ","-")
-        # SECONDARY and TOP PLAY badges are hidden per your call — WATCH
-        # (and anything else) still shows.
         tag_html = f'<span class="tag {cls}">{tag_val}</span>' if tag_val and tag_val not in ("TOP PLAY", "SECONDARY") else ""
         vc  = "pos" if t.get("value_pct",0)>0 else "neg"
         out += (
@@ -1244,13 +1109,6 @@ def _cards_js(tips_list, label, container_id, odds_label="ODDS"):
         )
     out += "</div>"
     return out
-
-# ---------------------------------------------------------------------------
-# Multi cards — a multi bet chains several race legs into one parlay, so it
-# gets its own nicely laid-out card: one compact row per leg (silk, horse,
-# where/when, leg odds) and a two-tile footer for the combined price + stake,
-# instead of forcing it into the single-horse stat-grid used by Back/Place.
-# ---------------------------------------------------------------------------
 
 def _multi_leg_html(leg):
     number = _get_horse_number(leg)
@@ -1352,7 +1210,6 @@ def _tips_body(store):
 
 @app.get("/", response_class=HTMLResponse)
 async def home_redirect():
-    # The Dashboard is the app's landing page — Tips lives at /tips now.
     return RedirectResponse(url="/dash")
 
 @app.get("/portal", response_class=HTMLResponse)
@@ -1394,9 +1251,6 @@ def _dash_body(store, friend=False):
 
     tips_base = "/portal/tips" if friend else "/tips"
 
-    # Bet-type boxes are now the only route into Tips — clicking one jumps
-    # straight to that tab. Each also shows its share of today's selections
-    # and gets a colour-matched top edge so the three read as a set.
     def _sc(tid, count, color, label):
         pct = round(100*count/len(all_t)) if all_t else 0
         return (
@@ -1407,8 +1261,6 @@ def _dash_body(store, friend=False):
             f'<div class="sc-pct">{pct}% of tips</div></div>'
         )
 
-    # Best Bet spotlight — whichever selection is carrying the most stake
-    # today, since that's the one the model is most confident in.
     spotlight_html = ""
     if best:
         b_type = best.get("type","")
@@ -1446,8 +1298,6 @@ def _dash_body(store, friend=False):
             '</div>'
         )
 
-    # Units-by-type bar — quick visual read on where today's stake is
-    # concentrated, only shown once there's actually something staked.
     type_bar_html = ""
     if total_u > 0:
         back_pct  = round(100*back_u/total_u)
@@ -1469,12 +1319,6 @@ def _dash_body(store, friend=False):
             '</div>'
         )
 
-    # Next 5 races — every race is rendered as a hidden template row tagged
-    # with its raw time string. Client-side JS reads the viewer's own local
-    # clock (same approach as the Analyzer countdown), drops any race whose
-    # start time has already passed, and shows only the soonest 5 that are
-    # still upcoming. It re-checks every 30s so races roll off the list live
-    # as the day goes on, without needing the page to reload.
     all_sorted = sorted(analyzer, key=lambda r: _time_key(r.get("time","")))
     tmpl_rows = ""
     for r in all_sorted:
@@ -1620,8 +1464,6 @@ function _parseRaceTime(str){
     if(ap==='PM' && h<12) h+=12;
     if(ap==='AM' && h===12) h=0;
   } else {
-    // Assume all race times before 1:00 are afternoon (e.g. 1:00 = 13:00+),
-    // but anything before 1:00 (11:30, 12:20, etc.) is always morning.
     if(h >= 1 && h <= 10){
       h += 12;
     }
@@ -1673,17 +1515,23 @@ async def analyzer_page():
     return HTMLResponse(_cached_page("analyzer", lambda: _shell("analyzer", _analyzer_body(_store), _store)))
 
 # ---------------------------------------------------------------------------
-# Watch — live stream tab. The source is an HLS (.m3u8) feed, which can't be
-# dropped into an <iframe> like a normal web page, so it plays in a native
-# <video> element instead: Safari/iOS plays HLS natively, everything else
-# goes through hls.js (loaded from cdnjs). Both /watch and /portal/watch use
-# _watch_body(), so both get this player.
+# Watch — live stream tab. Two sources now: Sky 1 and Sky 2, each shown as a
+# tab with the broadcaster's own logo instead of a plain text label. Source
+# is an HLS (.m3u8) feed, which can't be dropped into an <iframe> like a
+# normal web page, so it plays in a native <video> element instead:
+# Safari/iOS plays HLS natively, everything else goes through hls.js (loaded
+# from cdnjs). Both /watch and /portal/watch use _watch_body(), so both get
+# this player.
 #
-# To add another stream later, just append to STREAM_SOURCES — a tab bar
-# appears automatically once there is more than one.
+# To add another stream later, just append to STREAM_SOURCES with an "icon"
+# data URI (or omit "icon" to fall back to plain text) — a tab bar appears
+# automatically once there is more than one.
 # ---------------------------------------------------------------------------
 STREAM_SOURCES = [
-    {"id": "live", "label": "Live", "url": "https://skylivetab-new.akamaized.net/hls/live/2038780/sky1/index.m3u8"},
+    {"id": "sky1", "label": "Sky 1", "url": "https://skylivetab-new.akamaized.net/hls/live/2038780/sky1/index.m3u8",
+     "icon": "data:image/png;base64,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"},
+    {"id": "sky2", "label": "Sky 2", "url": "https://skylivetab-new.akamaized.net/hls/live/2038781/sky2/index.m3u8",
+     "icon": "data:image/png;base64,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"},
 ]
 
 def _watch_body():
@@ -1692,7 +1540,9 @@ def _watch_body():
     if multi:
         tabs_html = '<div class="tabs">' + "".join(
             f'<button class="tab{" active" if i==0 else ""}" data-tab="watch" '
-            f'onclick="switchWatch(\'{s["id"]}\',this)">{s["label"]}</button>'
+            f'onclick="switchWatch(\'{s["id"]}\',this)">'
+            + (f'<img src="{s["icon"]}" alt="{s["label"]}" style="height:16px;vertical-align:middle;">' if s.get("icon") else s["label"])
+            + '</button>'
             for i, s in enumerate(STREAM_SOURCES)
         ) + '</div>'
     panes_html = "".join(
@@ -1723,7 +1573,6 @@ function initStream(id){{
   if(!video || _hlsPlayers[id]) return;
   var src=video.getAttribute('data-src');
   if(video.canPlayType('application/vnd.apple.mpegurl')){{
-    // Safari / iOS: native HLS
     video.src=src;
     _hlsPlayers[id]='native';
     video.addEventListener('error',function(){{ _watchMsg(id,'Stream unavailable right now.'); }});
@@ -1773,12 +1622,6 @@ async def watch_page():
 @app.get("/portal/watch", response_class=HTMLResponse)
 async def portal_watch_page():
     return HTMLResponse(_cached_page("portal_watch", lambda: _shell("watch", _watch_body(), _store, friend=True)))
-
-# ---------------------------------------------------------------------------
-# Settings — jump-time push notifications. Subscriptions are per-device (the
-# browser's own push subscription), so this page talks to /api/push/* to
-# read/write settings for whichever device/browser has it open.
-# ---------------------------------------------------------------------------
 
 def _settings_body():
     if not _PUSH_LIB_AVAILABLE:
