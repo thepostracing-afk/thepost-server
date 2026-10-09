@@ -235,22 +235,14 @@ def _cached_page(key, build_fn):
 # ---------------------------------------------------------------------------
 # Freshness guarantee — every page/API route calls this first.
 #
-# The old design trusted this process's in-memory _store between pushes,
-# with a 45s background loop as the only thing pulling from Upstash. That
-# meant a page load could show stale (or default/empty) data for up to 45s
-# after a push — worse if this process had just cold-started (Render
-# free-tier dynos sleep after 15 min idle and wake on the next request,
-# starting from whatever _load() returned at that exact moment) or if the
-# platform was ever routing requests to more than one process, since each
-# process only has its own memory.
-#
-# _refresh_store() makes _store authoritative on every single request
-# instead: it re-reads Upstash and only replaces _store if the stored
-# push_count has actually moved on, so a page NEVER shows behind what was
-# actually pushed, no matter which process serves the request or how long
-# it's been asleep. The round trip is a few ms on Upstash's REST API and
-# only happens when something might have changed, so normal browsing stays
-# fast — nothing here waits on the push itself, only on reads.
+# _refresh_store() re-reads Upstash on every request, but ONLY adopts the
+# Upstash copy if its push_count is strictly NEWER (>) than what this
+# process already holds. Using "!=" here was a bug: if a push's write to
+# Upstash lagged or failed, the next request would read Upstash's older
+# copy, see it differed from the correct freshly-pushed local data, and
+# overwrite the correct data with the stale copy. With ">" a successful
+# push can never be undone by a slow/failed Upstash write, while a newer
+# push made by another process/instance is still picked up.
 # ---------------------------------------------------------------------------
 async def _refresh_store():
     if not (UPSTASH_URL and UPSTASH_TOKEN):
@@ -262,11 +254,14 @@ async def _refresh_store():
         fresh = await run_in_threadpool(_load)
     except Exception:
         return
-    if fresh.get("push_count", 0) != _store.get("push_count", 0):
+    if fresh.get("push_count", 0) > _store.get("push_count", 0):
         async with _push_lock:
-            _store.clear()
-            _store.update(fresh)
-            _store.setdefault("push_subs", {})
+            # Re-check inside the lock: a /push may have landed while we
+            # were fetching from Upstash.
+            if fresh.get("push_count", 0) > _store.get("push_count", 0):
+                _store.clear()
+                _store.update(fresh)
+                _store.setdefault("push_subs", {})
 
 # ---------------------------------------------------------------------------
 # Jump-time push notifications — BACK/PLACE/MULTI tips only, Saturdays only.
@@ -375,16 +370,19 @@ async def _notify_tick():
 async def _start_background_sync():
     """Belt-and-braces: re-pull from Upstash every 45s in the background so
     the in-memory store self-heals if this process restarts elsewhere or
-    another instance pushes — without making every request pay for it."""
+    another instance pushes — without making every request pay for it.
+    Only ever adopts Upstash data that is strictly newer (>) than local."""
     async def _loop():
         while True:
             await asyncio.sleep(45)
             try:
                 fresh = await run_in_threadpool(_load)
-                if fresh.get("push_count", 0) != _store.get("push_count", 0):
-                    _store.clear()
-                    _store.update(fresh)
-                    _store.setdefault("push_subs", {})
+                if fresh.get("push_count", 0) > _store.get("push_count", 0):
+                    async with _push_lock:
+                        if fresh.get("push_count", 0) > _store.get("push_count", 0):
+                            _store.clear()
+                            _store.update(fresh)
+                            _store.setdefault("push_subs", {})
             except Exception:
                 pass
     asyncio.create_task(_loop())
