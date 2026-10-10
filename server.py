@@ -48,7 +48,7 @@ UPSTASH_URL   = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 STORE_KEY     = "thepost_store"
 
-DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "last_push": None, "push_count": 0, "push_subs": {}}
+DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "last_push": None, "push_count": 0, "push_subs": {}, "pnl": None}
 
 app = FastAPI(title="The Post", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -410,6 +410,7 @@ async def push(request: Request, x_api_key: str = Header(default="")):
         new_tips     = body.get("tips",[])
         new_analyzer = body.get("analyzer",[])
         new_live     = body.get("live",[])
+        new_pnl      = body.get("pnl")  # today's P&L from the desktop app (None if not sent)
         # Defense in depth: refuse an entirely empty payload if we're
         # already holding real data. A genuinely empty day still has
         # analyzer races (the CSVs were scanned), so tips AND analyzer
@@ -423,6 +424,12 @@ async def push(request: Request, x_api_key: str = Header(default="")):
             and (_store.get("tips") or _store.get("analyzer"))
         )
         if is_suspicious_empty:
+            # Still accept a changed P&L (e.g. a bet was just marked while the
+            # bet lists were momentarily empty) — it never touches tips.
+            if isinstance(new_pnl, dict) and new_pnl != _store.get("pnl"):
+                _store["pnl"] = new_pnl
+                _store["push_count"] += 1
+                await run_in_threadpool(_save, _store)
             return {
                 "status": "rejected", "reason": "empty payload ignored, kept previous data",
                 "tips": len(_store["tips"]), "analyzer_races": len(_store["analyzer"]),
@@ -431,6 +438,8 @@ async def push(request: Request, x_api_key: str = Header(default="")):
         _store["tips"]        = new_tips
         _store["analyzer"]    = new_analyzer
         _store["live"]        = new_live
+        if isinstance(new_pnl, dict):
+            _store["pnl"] = new_pnl
         _store["last_push"]   = body.get("generated_at") or datetime.datetime.now().isoformat()
         _store["push_count"] += 1
         # Offloaded to a thread so the Upstash write (a blocking `requests`
@@ -930,6 +939,16 @@ input:checked + .slider{background:#1a3a1a;border-color:var(--green);}
 input:checked + .slider:before{transform:translateX(18px);background:var(--green);}
 .mins-input{width:56px;background:var(--el);border:1px solid var(--bd);color:var(--t1);border-radius:6px;padding:5px;text-align:center;font-size:12.5px;}
 .push-status{font-size:10.5px;color:var(--t2);margin-top:8px;}
+.pnl-big{font-size:30px;font-weight:800;line-height:1.1;}
+.pnl-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 2px;border-bottom:1px solid var(--bd);}
+.pnl-row:last-child{border-bottom:none;}
+.pnl-main{min-width:0;flex:1;}
+.pnl-horse{font-size:12.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.pnl-sub{font-size:10px;color:var(--t2);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.pnl-val{font-size:13px;font-weight:700;flex-shrink:0;}
+.pnl-tag{font-size:9px;font-weight:700;padding:2px 7px;border-radius:20px;flex-shrink:0;}
+.pnl-tag.win{background:#1a3a1a;color:var(--green);}
+.pnl-tag.loss{background:#2a1a1a;color:var(--red);}
 </style>
 </head>
 <body>
@@ -965,6 +984,7 @@ input:checked + .slider:before{transform:translateX(18px);background:var(--green
 """ if friend else """  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
   <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/tips'"><span class="ni">&#x1F3C7;</span>Tips</button>
   <button class="nbtn """ + ("active" if page_id=="analyzer" else "") + """ " onclick="location.href='/analyzer'"><span class="ni">&#x1F50D;</span>Analyzer</button>
+  <button class="nbtn """ + ("active" if page_id=="pnl" else "") + """ " onclick="location.href='/pnl'"><span class="ni">&#x1F4B0;</span>P&amp;L</button>
   <button class="nbtn """ + ("active" if page_id=="watch" else "") + """ " onclick="location.href='/watch'"><span class="ni">&#x1F4FA;</span>Watch</button>
   <button class="nbtn """ + ("active" if page_id=="settings" else "") + """ " onclick="location.href='/settings'"><span class="ni">&#x2699;&#xFE0F;</span>Settings</button>
 """) + """</nav>
@@ -1847,6 +1867,71 @@ async def watch_page():
 async def portal_watch_page():
     await _refresh_store()
     return HTMLResponse(_cached_page("portal_watch", lambda: _shell("watch", _watch_body(), _store, friend=True)))
+
+# ---------------------------------------------------------------------------
+# P&L — today's results only. The desktop app sends just the records dated
+# the day each bet was marked WIN/LOSS; this page shows them. If the stored
+# P&L is from a previous day (nothing marked yet today) it shows an empty day
+# rather than yesterday's numbers.
+# ---------------------------------------------------------------------------
+
+def _pnl_body(store):
+    pnl = store.get("pnl") or {}
+    today = datetime.datetime.now(NOTIFY_TZ).date().isoformat()
+    if not pnl or pnl.get("date") != today:
+        return ('<div class="content"><div class="card"><div class="stat-label" style="margin-bottom:6px;">Today\'s P&amp;L</div>'
+                '<div class="pnl-big" style="color:var(--t2);">0.00u</div>'
+                '<div class="stat-sub">No bets marked today yet</div></div></div>')
+    total = float(pnl.get("total", 0) or 0)
+    bets  = int(pnl.get("bets", 0) or 0)
+    wins  = int(pnl.get("wins", 0) or 0)
+    rate  = float(pnl.get("win_rate", 0) or 0)
+    col   = "var(--green)" if total > 0 else ("var(--red)" if total < 0 else "var(--t2)")
+    rows = ""
+    for r in pnl.get("records", []) or []:
+        p = float(r.get("pnl_units", 0) or 0)
+        pc = "var(--green)" if p > 0 else ("var(--red)" if p < 0 else "var(--t2)")
+        res = str(r.get("result", "")).upper()
+        tag_cls = "win" if res == "WIN" else "loss"
+        sub = " &middot; ".join(x for x in (
+            str(r.get("type", "")).title(),
+            str(r.get("track", "")),
+            f'{float(r.get("units", 0) or 0):g}u @ ${float(r.get("real_odds", 0) or 0):.2f}',
+        ) if x)
+        rows += (
+            '<div class="pnl-row">'
+            '<div class="pnl-main">'
+            f'<div class="pnl-horse">{r.get("horse", "")}</div>'
+            f'<div class="pnl-sub">{sub}</div>'
+            '</div>'
+            f'<span class="pnl-tag {tag_cls}">{res or "-"}</span>'
+            f'<span class="pnl-val" style="color:{pc};">{p:+.2f}u</span>'
+            '</div>'
+        )
+    if not rows:
+        rows = '<p class="empty" style="padding:18px 0;">No bets marked today yet</p>'
+    return (
+        '<div class="content">'
+        '<div class="card" style="margin-bottom:9px;">'
+        '<div class="stat-label" style="margin-bottom:6px;">Today\'s P&amp;L</div>'
+        f'<div class="pnl-big" style="color:{col};">{total:+.2f}u</div>'
+        f'<div class="stat-sub">{pnl.get("date", "")}</div>'
+        '</div>'
+        '<div class="summary">'
+        f'<div class="sc"><div class="sn">{bets}</div><div class="sl2">Bets</div></div>'
+        f'<div class="sc"><div class="sn" style="color:var(--green)">{wins}</div><div class="sl2">Wins</div></div>'
+        f'<div class="sc"><div class="sn" style="color:var(--acc)">{rate:.0f}%</div><div class="sl2">Win Rate</div></div>'
+        '</div>'
+        f'<div class="card">{rows}</div>'
+        '</div>'
+    )
+
+@app.get("/pnl", response_class=HTMLResponse)
+async def pnl_page():
+    await _refresh_store()
+    # Not cached: the "is this today's P&L?" check depends on the clock, not
+    # just push_count, so it has to be evaluated on each request.
+    return HTMLResponse(_shell("pnl", _pnl_body(_store), _store))
 
 # ---------------------------------------------------------------------------
 # Settings — jump-time push notifications. Subscriptions are per-device (the
