@@ -940,6 +940,9 @@ input:checked + .slider:before{transform:translateX(18px);background:var(--green
 .mins-input{width:56px;background:var(--el);border:1px solid var(--bd);color:var(--t1);border-radius:6px;padding:5px;text-align:center;font-size:12.5px;}
 .push-status{font-size:10.5px;color:var(--t2);margin-top:8px;}
 .pnl-big{font-size:30px;font-weight:800;line-height:1.1;}
+.pnl-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 11px;cursor:pointer;}
+.pnl-caret{color:var(--t2);font-size:14px;transition:transform .15s;}
+.pnl-head.open .pnl-caret{transform:rotate(180deg);color:var(--acc);}
 .pnl-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 2px;border-bottom:1px solid var(--bd);}
 .pnl-row:last-child{border-bottom:none;}
 .pnl-main{min-width:0;flex:1;}
@@ -984,7 +987,6 @@ input:checked + .slider:before{transform:translateX(18px);background:var(--green
 """ if friend else """  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
   <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/tips'"><span class="ni">&#x1F3C7;</span>Tips</button>
   <button class="nbtn """ + ("active" if page_id=="analyzer" else "") + """ " onclick="location.href='/analyzer'"><span class="ni">&#x1F50D;</span>Analyzer</button>
-  <button class="nbtn """ + ("active" if page_id=="pnl" else "") + """ " onclick="location.href='/pnl'"><span class="ni">&#x1F4B0;</span>P&amp;L</button>
   <button class="nbtn """ + ("active" if page_id=="watch" else "") + """ " onclick="location.href='/watch'"><span class="ni">&#x1F4FA;</span>Watch</button>
   <button class="nbtn """ + ("active" if page_id=="settings" else "") + """ " onclick="location.href='/settings'"><span class="ni">&#x2699;&#xFE0F;</span>Settings</button>
 """) + """</nav>
@@ -1625,6 +1627,7 @@ def _dash_body(store, friend=False):
         + _sc("tm", len(multi), "var(--warn)",  "Multi")
         + '</div>'
         + spotlight_html
+        + ("" if friend else _pnl_card(store))
         + f'<div class="card stat-card green" style="margin-bottom:9px;"><div class="stat-label">Races Loaded</div><div class="stat-value">{t_races}</div><div class="stat-sub">{t_run} runners</div></div>'
         + type_bar_html
         + next_html +
@@ -1636,7 +1639,7 @@ def _dash_body(store, friend=False):
 @app.get("/dash", response_class=HTMLResponse)
 async def dash_page():
     await _refresh_store()
-    return HTMLResponse(_cached_page("dash", lambda: _shell("dash", _dash_body(_store), _store)))
+    return HTMLResponse(_cached_page("dash:" + _today_str(), lambda: _shell("dash", _dash_body(_store), _store)))
 
 @app.get("/portal/dash", response_class=HTMLResponse)
 async def portal_dash_page():
@@ -1869,27 +1872,36 @@ async def portal_watch_page():
     return HTMLResponse(_cached_page("portal_watch", lambda: _shell("watch", _watch_body(), _store, friend=True)))
 
 # ---------------------------------------------------------------------------
-# P&L — today's results only. The desktop app sends just the records dated
-# the day each bet was marked WIN/LOSS; this page shows them. If the stored
-# P&L is from a previous day (nothing marked yet today) it shows an empty day
-# rather than yesterday's numbers.
+# Today's P&L card (Dashboard, owner pages only). The desktop app sends just
+# the records dated the day each bet was marked WIN/LOSS. The card shows the
+# day's net units; tapping it expands the day's bets with units won/lost.
+# If the stored P&L is from an earlier day, it shows an empty day instead.
 # ---------------------------------------------------------------------------
 
-def _pnl_body(store):
+def _today_str():
+    return datetime.datetime.now(NOTIFY_TZ).date().isoformat()
+
+def _pnl_card(store):
     pnl = store.get("pnl") or {}
-    today = datetime.datetime.now(NOTIFY_TZ).date().isoformat()
-    if not pnl or pnl.get("date") != today:
-        return ('<div class="content"><div class="card"><div class="stat-label" style="margin-bottom:6px;">Today\'s P&amp;L</div>'
-                '<div class="pnl-big" style="color:var(--t2);">0.00u</div>'
-                '<div class="stat-sub">No bets marked today yet</div></div></div>')
-    total = float(pnl.get("total", 0) or 0)
-    bets  = int(pnl.get("bets", 0) or 0)
-    wins  = int(pnl.get("wins", 0) or 0)
-    rate  = float(pnl.get("win_rate", 0) or 0)
-    col   = "var(--green)" if total > 0 else ("var(--red)" if total < 0 else "var(--t2)")
+    recs = (pnl.get("records") or []) if pnl.get("date") == _today_str() else []
+    if not recs:
+        return (
+            '<div class="card" style="margin-bottom:9px;">'
+            '<div class="stat-label" style="margin-bottom:6px;">Today\'s P&amp;L</div>'
+            '<div class="pnl-big" style="color:var(--t2);">0.00u</div>'
+            '<div class="stat-sub">No bets marked today yet</div>'
+            '</div>'
+        )
+    pls = [float(r.get("pnl_units", 0) or 0) for r in recs]
+    net = sum(pls)
+    won_u  = sum(p for p in pls if p > 0)
+    lost_u = sum(p for p in pls if p < 0)
+    n = len(recs)
+    wins = sum(1 for r in recs if str(r.get("result", "")).upper() == "WIN")
+    losses = n - wins
+    col = "var(--green)" if net > 0 else ("var(--red)" if net < 0 else "var(--t2)")
     rows = ""
-    for r in pnl.get("records", []) or []:
-        p = float(r.get("pnl_units", 0) or 0)
+    for r, p in zip(recs, pls):
         pc = "var(--green)" if p > 0 else ("var(--red)" if p < 0 else "var(--t2)")
         res = str(r.get("result", "")).upper()
         tag_cls = "win" if res == "WIN" else "loss"
@@ -1908,30 +1920,26 @@ def _pnl_body(store):
             f'<span class="pnl-val" style="color:{pc};">{p:+.2f}u</span>'
             '</div>'
         )
-    if not rows:
-        rows = '<p class="empty" style="padding:18px 0;">No bets marked today yet</p>'
     return (
-        '<div class="content">'
-        '<div class="card" style="margin-bottom:9px;">'
-        '<div class="stat-label" style="margin-bottom:6px;">Today\'s P&amp;L</div>'
-        f'<div class="pnl-big" style="color:{col};">{total:+.2f}u</div>'
-        f'<div class="stat-sub">{pnl.get("date", "")}</div>'
+        '<div class="card pnl-card" style="margin-bottom:9px;padding:0;overflow:hidden;">'
+        '<div class="pnl-head" onclick="this.classList.toggle(\'open\');document.getElementById(\'pnl-body\').classList.toggle(\'open\');">'
+        '<div>'
+        '<div class="stat-label" style="margin-bottom:4px;">Today\'s P&amp;L</div>'
+        f'<div class="pnl-big" style="color:{col};">{net:+.2f}u</div>'
+        f'<div class="stat-sub">{n} bet{"s" if n != 1 else ""} &middot; {wins} won &middot; {losses} lost &middot; tap for bets</div>'
         '</div>'
-        '<div class="summary">'
-        f'<div class="sc"><div class="sn">{bets}</div><div class="sl2">Bets</div></div>'
-        f'<div class="sc"><div class="sn" style="color:var(--green)">{wins}</div><div class="sl2">Wins</div></div>'
-        f'<div class="sc"><div class="sn" style="color:var(--acc)">{rate:.0f}%</div><div class="sl2">Win Rate</div></div>'
+        '<span class="pnl-caret">&#x25BE;</span>'
         '</div>'
-        f'<div class="card">{rows}</div>'
+        '<div class="rbody" id="pnl-body">'
+        '<div style="display:flex;gap:6px;padding:9px 11px 4px;">'
+        f'<div class="sc"><div class="sn" style="color:var(--green);font-size:15px;">{won_u:+.2f}u</div><div class="sl2">Units won</div></div>'
+        f'<div class="sc"><div class="sn" style="color:var(--red);font-size:15px;">{lost_u:+.2f}u</div><div class="sl2">Units lost</div></div>'
+        f'<div class="sc"><div class="sn" style="color:{col};font-size:15px;">{net:+.2f}u</div><div class="sl2">Net</div></div>'
+        '</div>'
+        f'<div style="padding:2px 11px 6px;">{rows}</div>'
+        '</div>'
         '</div>'
     )
-
-@app.get("/pnl", response_class=HTMLResponse)
-async def pnl_page():
-    await _refresh_store()
-    # Not cached: the "is this today's P&L?" check depends on the clock, not
-    # just push_count, so it has to be evaluated on each request.
-    return HTMLResponse(_shell("pnl", _pnl_body(_store), _store))
 
 # ---------------------------------------------------------------------------
 # Settings — jump-time push notifications. Subscriptions are per-device (the
