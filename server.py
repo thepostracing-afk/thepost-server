@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Post — Live Tips Server  v6 (persistent storage via Upstash Redis)"""
+"""The Post — Live Tips Server  v7 (persistent storage via Upstash Redis, cached silk blobs)"""
 
 import os, json, datetime, base64, hashlib, asyncio
 from collections import OrderedDict
@@ -74,6 +74,39 @@ def _silk_mem_cache_put(key, value):
     if len(_silk_mem_cache) > SILK_MEM_CACHE_MAX:
         _silk_mem_cache.popitem(last=False)
 
+# --- Inline (data: URI) silks -------------------------------------------------
+# The desktop app embeds each silk as a base64 data: URI. Pasting that straight
+# into every page means every viewer re-downloads every silk on every load and
+# every auto-reload. Instead, each distinct silk is decoded ONCE, stored here
+# under a short content hash, and served from /s/<hash> with a far-future
+# immutable Cache-Control — so a device downloads each silk once, ever.
+SILK_BLOB_MAX = 4000
+_silk_blobs = OrderedDict()      # short hash -> (content_type, bytes)
+_silk_uri_hash = {}              # sha1(data URI string) -> short hash (skips re-decoding)
+
+def _register_data_silk(data_uri):
+    """Decode an inline data: URI once and return the short hash it's served
+    under at /s/<hash>. Returns None if the URI can't be decoded."""
+    uri_key = hashlib.sha1(data_uri.encode("utf-8")).hexdigest()
+    h = _silk_uri_hash.get(uri_key)
+    if h and h in _silk_blobs:
+        return h
+    try:
+        header, b64 = data_uri.split(",", 1)
+        ctype = header[5:].split(";")[0].strip() or "image/png"
+        raw = base64.b64decode(b64)
+    except Exception:
+        return None
+    h = hashlib.sha1(raw).hexdigest()[:16]
+    _silk_blobs[h] = (ctype, raw)
+    _silk_blobs.move_to_end(h)
+    _silk_uri_hash[uri_key] = h
+    while len(_silk_blobs) > SILK_BLOB_MAX:
+        _silk_blobs.popitem(last=False)
+    if len(_silk_uri_hash) > SILK_BLOB_MAX * 2:
+        _silk_uri_hash.clear()
+    return h
+
 def _get_silk_url(d):
     """Pull whatever silk URL field is present on a tip/horse dict, trying
     every naming convention the desktop client might push (never generated,
@@ -99,14 +132,18 @@ def _silk_html(url, size=SILK_SIZE):
     """Render the shared silk component. If no silk is available, render an
     identically-sized blank slot instead — never a placeholder icon, never a
     different image."""
+    blank = f'<span class="silk-wrap" style="width:{size}px;height:{size}px;"></span>'
     if not url:
-        return f'<span class="silk-wrap" style="width:{size}px;height:{size}px;"></span>'
-    # The desktop app now embeds the silk directly as a base64 data: URI
-    # (it resolves the local silk file or CDN URL itself, so the browser
-    # never has to fetch anything). Only route through the /silk network
-    # proxy for a genuine remote URL — a data: URI can't be fetched by
-    # requests.get() and should just be used as-is.
-    src = url if url.startswith("data:") else f"/silk?u={quote(url, safe='')}"
+        return blank
+    # Inline data: URIs are decoded once and served from /s/<hash> (cached
+    # forever by the browser). Genuine remote URLs go through the /silk proxy.
+    if url.startswith("data:"):
+        h = _register_data_silk(url)
+        if not h:
+            return blank
+        src = f"/s/{h}"
+    else:
+        src = f"/silk?u={quote(url, safe='')}"
     return (
         f'<span class="silk-wrap" style="width:{size}px;height:{size}px;">'
         f'<img class="silk-img" src="{src}" width="{size}" height="{size}" '
@@ -164,6 +201,20 @@ async def silk_proxy(u: str = ""):
     except Exception:
         raise HTTPException(status_code=404, detail="silk unavailable")
 
+@app.get("/s/{h}")
+async def silk_blob(h: str):
+    """Serves a decoded inline silk by its content hash. The hash is derived
+    from the image bytes, so the URL never changes for the same silk and the
+    browser can cache it for a year."""
+    hit = _silk_blobs.get(h)
+    if not hit:
+        raise HTTPException(status_code=404, detail="silk unavailable")
+    ctype, data = hit
+    return Response(data, media_type=ctype, headers={
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "ETag": f'"{h}"',
+    })
+
 @app.get("/icon.png")
 async def serve_icon():
     from fastapi.responses import FileResponse
@@ -216,6 +267,26 @@ _store = _load()
 _store.setdefault("push_subs", {})  # older persisted stores may predate this key
 _push_lock = asyncio.Lock()
 
+def _register_all_silks():
+    """Decode every inline silk currently in the store so /s/<hash> URLs that
+    an already-open page (or a browser cache miss) asks for still resolve
+    after a restart or after newer data is adopted from Upstash."""
+    try:
+        for t in _store.get("tips", []):
+            for d in [t] + list(t.get("legs") or []):
+                u = _get_silk_url(d)
+                if u.startswith("data:"):
+                    _register_data_silk(u)
+        for r in _store.get("analyzer", []):
+            for h in r.get("horses", []):
+                u = _get_silk_url(h)
+                if u.startswith("data:"):
+                    _register_data_silk(u)
+    except Exception:
+        pass
+
+_register_all_silks()
+
 # Rendered-HTML cache, keyed by page. Invalidated purely by push_count, which
 # only ever changes inside /push — so this is a safe signal that "the data
 # behind this page changed" and lets us skip rebuilding ~unchanged markup
@@ -262,6 +333,7 @@ async def _refresh_store():
                 _store.clear()
                 _store.update(fresh)
                 _store.setdefault("push_subs", {})
+                _register_all_silks()
 
 # ---------------------------------------------------------------------------
 # Jump-time push notifications — BACK/PLACE/MULTI tips only, Saturdays only.
@@ -333,7 +405,13 @@ async def _notify_tick():
             horse_label = f'{number}. {t.get("horse","")}' if number != "" else t.get("horse", "")
             track_label = t.get("track","")
             race_label  = t.get("race","")
-        icon = f"/silk?u={quote(silk, safe='')}" if (silk and not silk.startswith("data:")) else "/icon.png"
+        if silk and silk.startswith("data:"):
+            _h = _register_data_silk(silk)
+            icon = f"/s/{_h}" if _h else "/icon.png"
+        elif silk:
+            icon = f"/silk?u={quote(silk, safe='')}"
+        else:
+            icon = "/icon.png"
         for key, entry in subs:
             prefs = entry.get("prefs", {})
             if not prefs.get("enabled", True):
@@ -383,6 +461,7 @@ async def _start_background_sync():
                             _store.clear()
                             _store.update(fresh)
                             _store.setdefault("push_subs", {})
+                            _register_all_silks()
             except Exception:
                 pass
     asyncio.create_task(_loop())
@@ -442,6 +521,9 @@ async def push(request: Request, x_api_key: str = Header(default="")):
             _store["pnl"] = new_pnl
         _store["last_push"]   = body.get("generated_at") or datetime.datetime.now().isoformat()
         _store["push_count"] += 1
+        # Decode any new inline silks now, so /s/<hash> is ready before the
+        # first viewer's page (or its auto-reload) asks for it.
+        _register_all_silks()
         # Offloaded to a thread so the Upstash write (a blocking `requests`
         # call) never stalls the event loop that's serving everyone else.
         await run_in_threadpool(_save, _store)
@@ -1223,7 +1305,7 @@ function _runExportPhoto(){
     }));
   }).then(function(){
     // useCORS forces a fresh crossOrigin fetch even for images the browser
-    // already has cached (silks are inline data: URIs now anyway, and the
+    // already has cached (silks are same-origin /s/<hash> images now, and the
     // logo/icon is same-origin) — dropping it avoids a redundant re-download.
     //
     // iOS Safari's canvas engine reconstructs every border-radius/box-shadow
