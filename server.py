@@ -7,6 +7,8 @@ Patches The Post's server.py (v7) into v8:
     exactly as they were posted to Discord (price, units, day/time, P&L status).
   - Header shows when the tips were last sent. Jump-time notifications skip tips
     for another day.
+Safe to run again on a server that already has v8: it only adds what is missing (e.g. the
+Discord silk re-registration after a restart).
 Usage:  python patch_server_v8.py [path/to/server.py]
 Makes server_v7_backup.py next to it, then rewrites server.py. Nothing is written
 if any anchor is missing.
@@ -20,15 +22,16 @@ s = raw.replace("\r\n", "\n")
 
 def rep(old, new, label):
     global s
+    if HAS_V8 and label != "silk registration":
+        return          # already patched to v8: only the silk step below may still be missing
     n = s.count(old)
     if n != 1:
         print(f"STOPPED: could not patch '{label}' (found {n} matches, expected 1). Nothing was written.")
         sys.exit(1)
     s = s.replace(old, new)
 
-if "def _discord_body(" in s:
-    print("This server.py already has the Discord page (v8). Nothing to do.")
-    sys.exit(0)
+HAS_V8 = "def _discord_body(" in s
+changed_any = False
 
 rep('"""The Post — Live Tips Server  v7 (persistent storage via Upstash Redis, cached silk blobs)"""',
     '"""The Post — Live Tips Server  v8 (held tips + Discord page, persistent storage via Upstash Redis, cached silk blobs)"""',
@@ -266,6 +269,26 @@ async def api_discord():
 '''
 rep('@app.get("/", response_class=HTMLResponse)\nasync def home_redirect():',
     NEW_PAGE + '@app.get("/", response_class=HTMLResponse)\nasync def home_redirect():', "discord page")
+
+
+changed_any = not HAS_V8
+
+# ---- silks of Discord tips must survive a server restart (works on v7 and on v8)
+SILK_ANCHOR = '''        for r in _store.get("analyzer", []):
+            for h in r.get("horses", []):
+                u = _get_silk_url(h)'''
+if 'for t in _store.get("discord_tips"' not in s:
+    rep(SILK_ANCHOR, '''        for t in _store.get("discord_tips", []) or []:
+            for d in [t] + list(t.get("legs") or []):
+                u = _get_silk_url(d)
+                if u.startswith("data:"):
+                    _register_data_silk(u)
+''' + SILK_ANCHOR, "silk registration")
+    changed_any = True
+
+if not changed_any:
+    print("This server.py already has everything in v8. Nothing to do.")
+    sys.exit(0)
 
 # ---- write (backup first)
 backup = os.path.join(os.path.dirname(os.path.abspath(path)), "server_v7_backup.py")
