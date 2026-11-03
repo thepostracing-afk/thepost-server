@@ -1,17 +1,33 @@
 #!/usr/bin/env python3
 """
-Patches The Post's server.py (v7) into v8:
-  - Tips are HELD: the server only replaces its tips when the desktop app says
-    tips_commit = true (a Discord send, or "Push tips to server now").
-  - New Discord page (/discord, /portal/discord, /api/discord) showing the tips
-    exactly as they were posted to Discord (price, units, day/time, P&L status).
-  - Header shows when the tips were last sent. Jump-time notifications skip tips
-    for another day.
-Safe to run again on a server that already has v8: it only adds what is missing (e.g. the
-Discord silk re-registration after a restart).
-Usage:  python patch_server_v8.py [path/to/server.py]
-Makes server_v7_backup.py next to it, then rewrites server.py. Nothing is written
-if any anchor is missing.
+Patches The Post's server.py (v7 or v8) into v9: notifications stay on.
+
+What was killing subscriptions:
+  1. Subscriptions lived inside the big tips blob. Any /push from a process that
+     had an older or empty copy (restart while Upstash was slow, an overlapping
+     Render deploy, a failed read) wrote a blob WITHOUT them and wiped every device.
+  2. subscribe never bumped push_count, so other processes never picked new
+     subscriptions up.
+  3. The send loop deleted a subscription the moment any error text contained
+     "404" or "410".
+  4. Nothing re-registered a device if the browser rotated or dropped its
+     subscription, and the Settings toggle showed OFF whenever the server had
+     lost the entry, even though the phone was still subscribed.
+
+What v9 does:
+  - Subscriptions live in their own Upstash hash (one field per device), so
+    /push can never overwrite them. Existing subscriptions are migrated.
+  - The server NEVER deletes a subscription because a send failed. A 404/410
+    only marks it "gone"; the device replaces it itself next time the app opens.
+    Subscriptions are only removed when the user turns notifications off.
+  - Every page now loads /push-heal.js: if notification permission is granted it
+    re-registers a lost subscription (keeping the saved settings) on its own.
+  - sw.js handles pushsubscriptionchange and updates itself immediately.
+  - Settings page no longer shows OFF for a device that is still subscribed.
+
+Safe to run again. Usage:  python patch_server_v9.py [path/to/server.py]
+Makes server_v8_backup.py next to it, then rewrites server.py. Nothing is
+written if any anchor is missing.
 """
 import os, sys, shutil
 
@@ -20,280 +36,521 @@ raw = open(path, "rb").read().decode("utf-8")
 crlf = "\r\n" in raw
 s = raw.replace("\r\n", "\n")
 
-def rep(old, new, label):
-    global s
-    if HAS_V8 and label != "silk registration":
-        return          # already patched to v8: only the silk step below may still be missing
-    n = s.count(old)
-    if n != 1:
-        print(f"STOPPED: could not patch '{label}' (found {n} matches, expected 1). Nothing was written.")
-        sys.exit(1)
-    s = s.replace(old, new)
-
-HAS_V8 = "def _discord_body(" in s
-changed_any = False
-
-rep('"""The Post — Live Tips Server  v7 (persistent storage via Upstash Redis, cached silk blobs)"""',
-    '"""The Post — Live Tips Server  v8 (held tips + Discord page, persistent storage via Upstash Redis, cached silk blobs)"""',
-    "docstring")
-
-rep('DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "last_push": None, "push_count": 0, "push_subs": {}, "pnl": None}',
-    'DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "last_push": None, "push_count": 0, "push_subs": {}, "pnl": None,\n'
-    '                 "discord_tips": [], "discord_updated": None, "tips_updated": None}',
-    "DEFAULT_STORE")
-
-rep('_store.setdefault("push_subs", {})  # older persisted stores may predate this key',
-    '_store.setdefault("push_subs", {})  # older persisted stores may predate this key\n'
-    '_store.setdefault("discord_tips", [])      # v8\n'
-    '_store.setdefault("discord_updated", None)\n'
-    '_store.setdefault("tips_updated", None)',
-    "store defaults")
-
-# ---- /push: hold tips unless the desktop commits them
-rep('        new_pnl      = body.get("pnl")  # today\'s P&L from the desktop app (None if not sent)',
-    '        new_pnl      = body.get("pnl")  # today\'s P&L from the desktop app (None if not sent)\n'
-    '        # v8: tips only change when the desktop app commits them (a Discord send or\n'
-    '        # "Push tips to server now"). Builds that don\'t send the flag always commit.\n'
-    '        tips_commit  = bool(body.get("tips_commit", True))\n'
-    '        new_discord  = body.get("discord_tips")   # None = not sent, list = the whole Discord board',
-    "push: read flags")
-
-rep('''        is_suspicious_empty = (
-            not new_tips and not new_analyzer
-            and (_store.get("tips") or _store.get("analyzer"))
-        )''',
-    '''        is_suspicious_empty = (
-            not new_analyzer and (not tips_commit or not new_tips)
-            and (_store.get("tips") or _store.get("analyzer"))
-        )''', "push: empty guard")
-
-rep('''            if isinstance(new_pnl, dict) and new_pnl != _store.get("pnl"):
-                _store["pnl"] = new_pnl
-                _store["push_count"] += 1
-                await run_in_threadpool(_save, _store)''',
-    '''            changed = False
-            if isinstance(new_pnl, dict) and new_pnl != _store.get("pnl"):
-                _store["pnl"] = new_pnl
-                changed = True
-            if isinstance(new_discord, list) and new_discord != _store.get("discord_tips"):
-                _store["discord_tips"] = new_discord
-                _store["discord_updated"] = datetime.datetime.now().isoformat()
-                changed = True
-            if changed:
-                _store["push_count"] += 1
-                await run_in_threadpool(_save, _store)''', "push: suspicious branch")
-
-rep('''        _store["tips"]        = new_tips
-        _store["analyzer"]    = new_analyzer''',
-    '''        if tips_commit:
-            _store["tips"]         = new_tips
-            _store["tips_updated"] = body.get("generated_at") or datetime.datetime.now().isoformat()
-        if isinstance(new_discord, list):
-            if new_discord != _store.get("discord_tips"):
-                _store["discord_updated"] = datetime.datetime.now().isoformat()
-            _store["discord_tips"] = new_discord
-        _store["analyzer"]    = new_analyzer''', "push: store tips")
-
-rep('    return {"status":"ok","tips":len(_store["tips"]),"analyzer_races":len(_store["analyzer"]),"live_races":len(_store["live"])}',
-    '    return {"status":"ok","tips":len(_store["tips"]),"analyzer_races":len(_store["analyzer"]),"live_races":len(_store["live"]),\n'
-    '            "tips_committed":tips_commit,"discord_tips":len(_store.get("discord_tips") or [])}',
-    "push: response")
-
-# ---- notifications: only tips for today
-rep('''        if ttype not in NOTIFY_TYPES:
-            continue
-        jump = _jump_dt_today(t.get("time", ""), now)''',
-    '''        if ttype not in NOTIFY_TYPES:
-            continue
-        rd = t.get("race_date")
-        if rd and rd != now.date().isoformat():
-            continue   # v8: a tip moved to another day must not alert today
-        jump = _jump_dt_today(t.get("time", ""), now)''', "notify: today only")
-
-# ---- header: when the tips were last sent
-rep('def _race_id(r):',
-    '''def _tips_sent_str(store):
-    """When the tips were last sent (tips are held between Discord sends)."""
-    try: return datetime.datetime.fromisoformat(store.get("tips_updated") or store["last_push"]).strftime("%d %b  %H:%M")
-    except: return "Never"
-
-def _race_id(r):''', "tips sent helper")
-rep('Last push: """ + pushed + """', 'Tips sent: """ + _tips_sent_str(store) + """', "header text")
-rep('    total  = len(store["tips"])',
-    '    total  = len(store.get("discord_tips") or []) if page_id == "discord" else len(store["tips"])',
-    "header count")
-
-# ---- nav buttons
-rep('''onclick="location.href='/tips'"><span class="ni">&#x1F3C7;</span>Tips</button>''',
-    '''onclick="location.href='/tips'"><span class="ni">&#x1F3C7;</span>Tips</button>
-  <button class="nbtn """ + ("active" if page_id=="discord" else "") + """ " onclick="location.href='/discord'"><span class="ni">&#x1F4E8;</span>Discord</button>''',
-    "owner nav")
-rep('''onclick="location.href='/portal/tips'"><span class="ni">&#x1F3C7;</span>Tips</button>''',
-    '''onclick="location.href='/portal/tips'"><span class="ni">&#x1F3C7;</span>Tips</button>
-  <button class="nbtn """ + ("active" if page_id=="discord" else "") + """ " onclick="location.href='/portal/discord'"><span class="ni">&#x1F4E8;</span>Discord</button>''',
-    "friend nav")
-
-# ---- the Discord page itself
-NEW_PAGE = r'''# ---------------------------------------------------------------------------
-# Discord tips (v8) — exactly what the desktop app posted to Discord: the price,
-# units, race day / time as sent, plus whether it has been saved to the P&L.
-# The desktop app owns the board and sends the whole list on every push, so this
-# page just shows it. Tips stay until the next Discord send.
-# ---------------------------------------------------------------------------
-import html as _html
-
-_DC_CSS = """<style>
-.dc-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:7px;font-size:10px;color:var(--t2);}
-.dc-ch{background:#1A2E4A;color:var(--acc);border-radius:20px;padding:2px 8px;font-weight:700;font-size:9px;letter-spacing:.3px;white-space:nowrap;}
-.dc-pnl{font-weight:700;white-space:nowrap;}
-.dc-note{font-size:10.5px;color:var(--t2);padding:2px 2px 10px;line-height:1.5;}
-</style>"""
-
-def _dc_sent_str(iso):
-    try: return datetime.datetime.fromisoformat(iso).strftime("%a %I:%M %p").replace(" 0", " ")
-    except Exception: return ""
-
-def _dc_day_prefix(t):
-    try:
-        d = datetime.date.fromisoformat(t.get("race_date", ""))
-        if d != datetime.datetime.now(NOTIFY_TZ).date():
-            return d.strftime("%a %d %b").upper() + " &middot; "
-    except Exception:
-        pass
-    return ""
-
-def _dc_foot(t):
-    res = str(t.get("result", "") or "").upper()
-    if res:
-        try: p = float(t.get("pnl_units") or 0)
-        except (TypeError, ValueError): p = 0.0
-        col = "var(--green)" if res == "WIN" else "var(--red)"
-        right = f'<span class="dc-pnl" style="color:{col};">{res} {p:+.2f}u</span>'
-    else:
-        right = '<span>Not in P&amp;L yet</span>'
-    ch = _html.escape(str(t.get("channel", "") or "Discord"))
-    return (f'<div class="dc-foot"><span><span class="dc-ch">{ch}</span>&nbsp; Sent {_dc_sent_str(t.get("sent_at", ""))}</span>'
-            f'{right}</div>')
-
-def _dc_f(v, default=0.0):
-    try: return float(v)
-    except (TypeError, ValueError): return default
-
-def _dc_single_card(t):
-    esc = _html.escape
-    typ = t.get("type", "BACK")
-    number = _get_horse_number(t)
-    horse = esc(f'{number}. {t.get("horse","")}' if number != "" else str(t.get("horse", "")))
-    tag_cls = "top-play" if typ == "BACK" else "secondary"
-    vp = _dc_f(t.get("value_pct"))
-    vc = "pos" if vp > 0 else "neg"
-    odds_label = "PLACE ODDS" if typ == "PLACE" else "ODDS"
-    return (
-        '<div class="card">'
-        f'<div class="ctop"><span class="horse-row">{_silk_html(_get_silk_url(t))}<span class="horse">{horse}</span></span>'
-        f'<span class="tag {tag_cls}">{esc(typ)}</span></div>'
-        f'<div class="meta">{_dc_day_prefix(t)}{esc(str(t.get("time","")))} &middot; {esc(str(t.get("track","")))} &middot; {esc(str(t.get("race","")))}</div>'
-        '<div class="stats">'
-        f'<div class="stat"><span class="sl">{odds_label}</span><span class="sv">${_dc_f(t.get("real_odds")):.2f}</span></div>'
-        f'<div class="stat"><span class="sl">UNITS</span><span class="sv">{_dc_f(t.get("units"), 1):g}u</span></div>'
-        f'<div class="stat"><span class="sl">VALUE</span><span class="sv {vc}">{vp:+.1f}%</span></div>'
-        f'<div class="stat"><span class="sl">RSI</span><span class="sv">{int(_dc_f(t.get("rsi")))}</span></div>'
-        f'<div class="stat"><span class="sl">WIN%</span><span class="sv">{_dc_f(t.get("win_pct")):.1f}%</span></div>'
-        '</div>'
-        f'{_dc_foot(t)}</div>'
-    )
-
-def _dc_multi_card(t):
-    legs = t.get("legs", []) or []
-    tracks = ", ".join(dict.fromkeys(l.get("track", "") for l in legs if l.get("track")))
-    title = f'{len(legs)}-Leg Multi' if legs else "Multi"
-    return (
-        '<div class="card multi-card">'
-        f'<div class="ctop"><span class="horse-row"><span class="horse">{title}</span></span><span class="tag watch">MULTI</span></div>'
-        f'<div class="meta">{_dc_day_prefix(t)}{_html.escape(tracks)}</div>'
-        f'<div class="multi-legs">{"".join(_multi_leg_html(l) for l in legs)}</div>'
-        '<div class="multi-foot">'
-        f'<div class="mf-item"><span class="sl">COMBINED ODDS</span><span class="sv">${_dc_f(t.get("combined_odds")):.2f}</span></div>'
-        f'<div class="mf-item"><span class="sl">UNITS</span><span class="sv">{_dc_f(t.get("units"), 1):g}u</span></div>'
-        '</div>'
-        f'{_dc_foot(t)}</div>'
-    )
-
-def _discord_body(store):
-    tips  = store.get("discord_tips") or []
-    back  = [t for t in tips if t.get("type") == "BACK"]
-    place = [t for t in tips if t.get("type") == "PLACE"]
-    multi = [t for t in tips if t.get("type") == "MULTI"]
-    if not tips:
-        return (_DC_CSS + '<div class="content"><p class="empty">Nothing sent to Discord yet.<br><br>'
-                'Tips you post from the app show up here exactly as posted (price, units, time) '
-                'and stay until you post new ones.</p></div>')
-    def section(items, label, sid, active):
-        inner = "".join(_dc_multi_card(t) if t.get("type") == "MULTI" else _dc_single_card(t) for t in items) \
-                or f'<p class="empty">No {label} tips sent</p>'
-        return f'<div class="section{" active" if active else ""}" id="{sid}" data-grp="dtips">{inner}</div>'
-    try:
-        upd = datetime.datetime.fromisoformat(store.get("discord_updated")).strftime("%a %d %b %H:%M")
-    except Exception:
-        upd = ""
-    return (
-        _DC_CSS +
-        '<div class="tabs">'
-        f'<button id="btn-db" class="tab active" data-tab="dtips" onclick="switchTab(\'db\',this,\'dtips\')">Back ({len(back)})</button>'
-        f'<button id="btn-dp" class="tab" data-tab="dtips" onclick="switchTab(\'dp\',this,\'dtips\')">Place ({len(place)})</button>'
-        f'<button id="btn-dm" class="tab" data-tab="dtips" onclick="switchTab(\'dm\',this,\'dtips\')">Multi ({len(multi)})</button>'
-        '</div>'
-        '<div class="content">'
-        f'<div class="dc-note">Exactly as posted to Discord{(" &middot; updated " + upd) if upd else ""}. These stay until new tips are posted.</div>'
-        + section(back, "back", "db", True) + section(place, "place", "dp", False) + section(multi, "multi", "dm", False) +
-        '</div>'
-        '<script>(function(){var p=new URLSearchParams(window.location.search).get("tab");'
-        'if(p){var b=document.getElementById("btn-"+p);if(b)b.click();}})();</script>'
-    )
-
-@app.get("/discord", response_class=HTMLResponse)
-async def discord_page():
-    await _refresh_store()
-    return HTMLResponse(_cached_page("discord:" + _today_str(), lambda: _shell("discord", _discord_body(_store), _store)))
-
-@app.get("/portal/discord", response_class=HTMLResponse)
-async def portal_discord_page():
-    await _refresh_store()
-    return HTMLResponse(_cached_page("portal_discord:" + _today_str(), lambda: _shell("discord", _discord_body(_store), _store, friend=True)))
-
-@app.get("/api/discord")
-async def api_discord():
-    await _refresh_store()
-    return JSONResponse({"updated": _store.get("discord_updated"), "tips": _store.get("discord_tips") or []})
-
-'''
-rep('@app.get("/", response_class=HTMLResponse)\nasync def home_redirect():',
-    NEW_PAGE + '@app.get("/", response_class=HTMLResponse)\nasync def home_redirect():', "discord page")
-
-
-changed_any = not HAS_V8
-
-# ---- silks of Discord tips must survive a server restart (works on v7 and on v8)
-SILK_ANCHOR = '''        for r in _store.get("analyzer", []):
-            for h in r.get("horses", []):
-                u = _get_silk_url(h)'''
-if 'for t in _store.get("discord_tips"' not in s:
-    rep(SILK_ANCHOR, '''        for t in _store.get("discord_tips", []) or []:
-            for d in [t] + list(t.get("legs") or []):
-                u = _get_silk_url(d)
-                if u.startswith("data:"):
-                    _register_data_silk(u)
-''' + SILK_ANCHOR, "silk registration")
-    changed_any = True
-
-if not changed_any:
-    print("This server.py already has everything in v8. Nothing to do.")
+if "def _subs_boot(" in s:
+    print("This server.py already has v9. Nothing to do.")
     sys.exit(0)
 
-# ---- write (backup first)
-backup = os.path.join(os.path.dirname(os.path.abspath(path)), "server_v7_backup.py")
+def fail(label, n):
+    print(f"STOPPED: could not patch '{label}' (found {n} matches, expected 1). Nothing was written.")
+    sys.exit(1)
+
+def rep(old, new, label):
+    global s
+    n = s.count(old)
+    if n != 1:
+        fail(label, n)
+    s = s.replace(old, new)
+
+def swap_between(start_marker, end_marker, new_block, label):
+    """Replace everything from start_marker up to (not including) end_marker."""
+    global s
+    a, b = s.count(start_marker), s.count(end_marker)
+    if a != 1: fail(label + " (start)", a)
+    if b != 1: fail(label + " (end)", b)
+    i, j = s.index(start_marker), s.index(end_marker)
+    if j < i:
+        print(f"STOPPED: '{label}' markers are in the wrong order. Nothing was written.")
+        sys.exit(1)
+    s = s[:i] + new_block + s[j:]
+
+# ---------------------------------------------------------------------------
+# 1. docstring label (only if present)
+# ---------------------------------------------------------------------------
+if "v8 (held tips + Discord page," in s:
+    s = s.replace("v8 (held tips + Discord page,", "v9 (durable push subs, held tips + Discord page,", 1)
+
+# ---------------------------------------------------------------------------
+# 2. _save never writes subscriptions into the big blob again
+# ---------------------------------------------------------------------------
+rep('        payload = json.dumps(s)',
+    '        # v9: push subscriptions live in their own Redis hash, never in this blob,\n'
+    '        # so a /push (or a stale process) can no longer wipe them.\n'
+    '        payload = json.dumps({k: v for k, v in s.items() if k != "push_subs"})',
+    "save: strip push_subs")
+
+# ---------------------------------------------------------------------------
+# 3. subscription storage
+# ---------------------------------------------------------------------------
+SUBS_BLOCK = '''_push_lock = asyncio.Lock()
+
+# ---------------------------------------------------------------------------
+# v9: durable push subscriptions. One Redis hash, one field per device, so
+# adding/removing a device is a single-field write that can never clobber the
+# others, and the tips blob (_save) never contains them.
+# ---------------------------------------------------------------------------
+SUBS_KEY = STORE_KEY + ":push_subs"
+_subs = {}   # sub_key -> {"subscription":..., "prefs":..., "gone":bool, "fails":int}
+
+def _redis_cmd(*cmd):
+    r = requests.post(UPSTASH_URL.rstrip("/"), headers=_headers(), json=list(cmd), timeout=5)
+    r.raise_for_status()
+    return r.json().get("result")
+
+def _subs_fetch():
+    """All stored subscriptions, or None if Redis could not be read (never
+    confuse 'could not read' with 'there are none')."""
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return None
+    try:
+        flat = _redis_cmd("HGETALL", SUBS_KEY) or []
+        out = {}
+        for i in range(0, len(flat) - 1, 2):
+            try: out[flat[i]] = json.loads(flat[i + 1])
+            except Exception: pass
+        return out
+    except Exception as e:
+        print(f"[subs] fetch failed: {e}")
+        return None
+
+def _subs_get(key):
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return None
+    try:
+        raw = _redis_cmd("HGET", SUBS_KEY, key)
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+def _subs_put(key, entry):
+    """Persist one device. True on success (or when Redis isn't configured)."""
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return True
+    try:
+        _redis_cmd("HSET", SUBS_KEY, key, json.dumps(entry))
+        return True
+    except Exception as e:
+        print(f"[subs] put failed: {e}")
+        return False
+
+def _subs_del(key):
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return True
+    try:
+        _redis_cmd("HDEL", SUBS_KEY, key)
+        return True
+    except Exception as e:
+        print(f"[subs] delete failed: {e}")
+        return False
+
+def _subs_boot():
+    """Load subscriptions at startup and migrate any that older versions kept
+    inside the tips blob (only when Redis was readable, so a failed read can
+    never cause a wipe)."""
+    fresh = _subs_fetch()
+    if fresh is not None:
+        _subs.update(fresh)
+    legacy = _store.get("push_subs") or {}
+    for k, e in legacy.items():
+        if isinstance(e, dict) and e.get("subscription"):
+            _subs.setdefault(k, e)
+    if legacy and fresh is not None:
+        ok = True
+        for k, e in legacy.items():
+            if k not in fresh and isinstance(e, dict) and e.get("subscription"):
+                ok = _subs_put(k, e) and ok
+        if ok:
+            _store["push_subs"] = {}
+            _save(_store)      # rewrites the blob without push_subs
+
+async def _sync_subs():
+    """Adopt what Redis holds (another process may have added/changed devices)."""
+    fresh = await run_in_threadpool(_subs_fetch)
+    if fresh is None:
+        return
+    _subs.clear()
+    _subs.update(fresh)
+
+async def _sub_lookup(key):
+    e = _subs.get(key)
+    if e is None:
+        e = await run_in_threadpool(_subs_get, key)
+        if e:
+            _subs[key] = e
+    return e
+
+def _push_status(exc):
+    """HTTP status of a failed web push, if the library gave us one."""
+    resp = getattr(exc, "response", None)
+    code = getattr(resp, "status_code", None)
+    if code:
+        return int(code)
+    txt = str(exc)
+    for c in (410, 404):
+        if f"Push failed: {c}" in txt or f"Response: <Response [{c}]>" in txt or f"[{c}]" in txt:
+            return c
+    return None
+'''
+rep('_push_lock = asyncio.Lock()', SUBS_BLOCK.rstrip("\n"), "subs infrastructure")
+
+rep('_register_all_silks()\n\n# Rendered-HTML cache',
+    '_register_all_silks()\n_subs_boot()\n\n# Rendered-HTML cache',
+    "boot hook")
+
+# ---------------------------------------------------------------------------
+# 4. keep subscriptions in sync between processes
+# ---------------------------------------------------------------------------
+rep('''    subs = list(_store.get("push_subs", {}).items())
+    if not subs:
+        return''',
+    '''    await _sync_subs()
+    subs = [(k, e) for k, e in _subs.items() if not e.get("gone")]
+    if not subs:
+        return''',
+    "notify: subs source")
+
+rep('''            try:
+                await run_in_threadpool(_send_push_sync, entry["subscription"], payload)
+                _notified.add(dedupe)
+            except WebPushException as e:
+                if "410" in str(e) or "404" in str(e):
+                    # Subscription expired/revoked on the browser's end — drop it.
+                    _store.get("push_subs", {}).pop(key, None)
+                    await run_in_threadpool(_save, _store)
+            except Exception:
+                pass''',
+    '''            try:
+                await run_in_threadpool(_send_push_sync, entry["subscription"], payload)
+                _notified.add(dedupe)
+                if entry.get("fails") or entry.get("gone"):
+                    entry["fails"] = 0
+                    entry.pop("gone", None)
+                    await run_in_threadpool(_subs_put, key, entry)
+            except Exception as e:
+                # v9: a failed send NEVER deletes a subscription. 404/410 just marks
+                # it gone (the device replaces it itself next time the app opens).
+                code = _push_status(e)
+                if code in (404, 410):
+                    entry["gone"] = True
+                else:
+                    entry["fails"] = int(entry.get("fails", 0) or 0) + 1
+                entry["last_error"] = f"{type(e).__name__}: {str(e)[:160]}"
+                print(f"[notify] send failed for {key}: status={code} {entry['last_error']}")
+                await run_in_threadpool(_subs_put, key, entry)''',
+    "notify: failure handling")
+
+rep('''                            _store.clear()
+                            _store.update(fresh)
+                            _store.setdefault("push_subs", {})
+                            _register_all_silks()
+            except Exception:
+                pass
+    asyncio.create_task(_loop())''',
+    '''                            _store.clear()
+                            _store.update(fresh)
+                            _store.setdefault("push_subs", {})
+                            _register_all_silks()
+                await _sync_subs()
+            except Exception:
+                pass
+    asyncio.create_task(_loop())''',
+    "background sync: subs")
+
+# ---------------------------------------------------------------------------
+# 5. subscribe / unsubscribe / prefs endpoints
+# ---------------------------------------------------------------------------
+ENDPOINTS = '''@app.get("/api/push/prefs")
+async def push_prefs_get(endpoint: str = ""):
+    if not endpoint:
+        return {"subscribed": False}
+    entry = await _sub_lookup(_sub_key(endpoint))
+    if not entry:
+        return {"subscribed": False}
+    return {"subscribed": True, "gone": bool(entry.get("gone")),
+            "prefs": entry.get("prefs", _default_prefs())}
+
+def _clean_prefs(prefs_in, base=None):
+    p = _default_prefs(base)
+    prefs_in = prefs_in or {}
+    if "enabled" in prefs_in: p["enabled"] = bool(prefs_in["enabled"])
+    if "place"   in prefs_in: p["place"]   = bool(prefs_in["place"])
+    if "multi"   in prefs_in: p["multi"]   = bool(prefs_in["multi"])
+    if "minutes_before" in prefs_in:
+        try: p["minutes_before"] = max(1, min(60, int(prefs_in["minutes_before"])))
+        except (TypeError, ValueError): pass
+    return p
+
+@app.post("/api/push/subscribe")
+async def push_subscribe(request: Request):
+    try: body = await request.json()
+    except: raise HTTPException(status_code=400, detail="Invalid JSON")
+    sub = body.get("subscription") or {}
+    endpoint = sub.get("endpoint")
+    if not endpoint:
+        raise HTTPException(status_code=400, detail="Missing subscription")
+    key = _sub_key(endpoint)
+    existing = await _sub_lookup(key)
+    old_ep = body.get("replaces")
+    old_key = _sub_key(old_ep) if old_ep and old_ep != endpoint else None
+    old_entry = await _sub_lookup(old_key) if old_key else None
+    resync = bool(body.get("resync"))
+    # An automatic re-registration keeps whatever settings the device already had.
+    if resync and existing:
+        base = existing.get("prefs")
+    elif resync and old_entry:
+        base = old_entry.get("prefs")
+    else:
+        base = None
+    prefs = _clean_prefs(body.get("prefs"), base) if not (resync and base) else _default_prefs(base)
+    entry = {"subscription": sub, "prefs": prefs, "fails": 0}
+    if existing and existing.get("created"):
+        entry["created"] = existing["created"]
+    else:
+        entry["created"] = datetime.datetime.now().isoformat()
+    ok = await run_in_threadpool(_subs_put, key, entry)
+    if not ok:
+        raise HTTPException(status_code=503, detail="Could not save subscription, try again")
+    _subs[key] = entry
+    if old_entry is not None and old_key:
+        # The device explicitly replaced this subscription with a new one.
+        _subs.pop(old_key, None)
+        await run_in_threadpool(_subs_del, old_key)
+    return {"status": "ok"}
+
+@app.post("/api/push/unsubscribe")
+async def push_unsubscribe(request: Request):
+    # Only reached when the user switches notifications off on that device.
+    try: body = await request.json()
+    except: raise HTTPException(status_code=400, detail="Invalid JSON")
+    endpoint = (body.get("subscription") or {}).get("endpoint") or body.get("endpoint")
+    if endpoint:
+        key = _sub_key(endpoint)
+        ok = await run_in_threadpool(_subs_del, key)
+        if not ok:
+            raise HTTPException(status_code=503, detail="Could not remove subscription, try again")
+        _subs.pop(key, None)
+    return {"status": "ok"}
+
+@app.post("/api/push/prefs")
+async def push_prefs_post(request: Request):
+    try: body = await request.json()
+    except: raise HTTPException(status_code=400, detail="Invalid JSON")
+    endpoint = (body.get("subscription") or {}).get("endpoint") or body.get("endpoint")
+    if not endpoint:
+        raise HTTPException(status_code=400, detail="Missing endpoint")
+    key = _sub_key(endpoint)
+    entry = await _sub_lookup(key)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Not subscribed")
+    entry["prefs"] = _clean_prefs(body.get("prefs"), entry.get("prefs"))
+    ok = await run_in_threadpool(_subs_put, key, entry)
+    if not ok:
+        raise HTTPException(status_code=503, detail="Could not save settings, try again")
+    _subs[key] = entry
+    return {"status": "ok", "prefs": entry["prefs"]}
+
+'''
+swap_between('@app.get("/api/push/prefs")', '@app.post("/api/push/test")', ENDPOINTS, "push endpoints")
+
+# ---------------------------------------------------------------------------
+# 6. service worker + heal script
+# ---------------------------------------------------------------------------
+SW_BLOCK = r'''@app.get("/sw.js")
+async def service_worker():
+    js = """
+self.addEventListener('install', function(event){ self.skipWaiting(); });
+self.addEventListener('activate', function(event){ event.waitUntil(self.clients.claim()); });
+self.addEventListener('push', function(event){
+  var data = {};
+  try { data = event.data ? event.data.json() : {}; } catch(e) {}
+  var title = data.title || 'The Post';
+  var options = {
+    body: data.body || '',
+    icon: data.icon || '/icon.png',
+    badge: '/icon.png',
+    tag: data.tag || undefined,
+    data: { url: data.url || '/' }
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+self.addEventListener('notificationclick', function(event){
+  event.notification.close();
+  var url = (event.notification.data && event.notification.data.url) || '/';
+  event.waitUntil(clients.openWindow(url));
+});
+// The browser rotated or dropped this device's subscription: get a new one and
+// tell the server, which carries the device's settings over to it.
+function _b64ToUint8(b64){
+  var pad = '='.repeat((4 - b64.length % 4) % 4);
+  var base64 = (b64 + pad).replace(/-/g, '+').replace(/_/g, '/');
+  var raw = atob(base64), arr = new Uint8Array(raw.length);
+  for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+self.addEventListener('pushsubscriptionchange', function(event){
+  event.waitUntil((async function(){
+    try {
+      var old = event.oldSubscription || null;
+      var sub = event.newSubscription || await self.registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: _b64ToUint8('__VAPID__')
+      });
+      await fetch('/api/push/subscribe', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({subscription: sub.toJSON(), resync: true, replaces: old ? old.endpoint : null})
+      });
+    } catch(e) {}
+  })());
+});
+""".replace("__VAPID__", VAPID_PUBLIC_KEY)
+    return Response(js, media_type="application/javascript", headers={"Cache-Control": "no-cache"})
+
+_HEAL_JS = r"""(function(){
+  var VAPID = "__VAPID__";
+  var FLAG = 'thepost_push_on', PK = 'thepost_push_prefs';
+  function b64(b){
+    var pad = '='.repeat((4 - b.length % 4) % 4);
+    var base64 = (b + pad).replace(/-/g, '+').replace(/_/g, '/');
+    var raw = atob(base64), arr = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+    return arr;
+  }
+  function post(path, body){
+    return fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  }
+  async function run(){
+    try {
+      if (!VAPID || !('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) return;
+      if (Notification.permission !== 'granted') return;
+      var want = false;
+      try { want = localStorage.getItem(FLAG) === '1'; } catch(e) {}
+      var reg = await navigator.serviceWorker.getRegistration('/sw.js');
+      if (!reg) {
+        if (!want) return;
+        reg = await navigator.serviceWorker.register('/sw.js');
+      }
+      await navigator.serviceWorker.ready;
+      var sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        if (!want) return;     // never turned on here, or turned off on purpose
+        sub = await reg.pushManager.subscribe({userVisibleOnly: true, applicationServerKey: b64(VAPID)});
+      }
+      var r = await fetch('/api/push/prefs?endpoint=' + encodeURIComponent(sub.endpoint));
+      var s = await r.json();
+      var prefs = s.prefs;
+      if (!prefs) { try { prefs = JSON.parse(localStorage.getItem(PK) || 'null'); } catch(e) {} }
+      if (!prefs) prefs = {enabled: true, place: true, multi: true, minutes_before: 5};
+      var replaces = null;
+      if (s.subscribed && s.gone) {
+        // the push service says this subscription is dead: swap it for a fresh one
+        replaces = sub.endpoint;
+        try { await sub.unsubscribe(); } catch(e) {}
+        sub = await reg.pushManager.subscribe({userVisibleOnly: true, applicationServerKey: b64(VAPID)});
+      } else if (s.subscribed) {
+        try { localStorage.setItem(FLAG, '1'); } catch(e) {}
+        return;
+      }
+      var res = await post('/api/push/subscribe', {subscription: sub.toJSON(), prefs: prefs, resync: true, replaces: replaces});
+      if (res.ok) { try { localStorage.setItem(FLAG, '1'); } catch(e) {} }
+    } catch(e) {}
+  }
+  var inflight = null;
+  window.thePostPushHeal = function(){
+    if (!inflight) inflight = run().then(function(){ inflight = null; }, function(){ inflight = null; });
+    return inflight;
+  };
+  window.thePostPushHeal();
+  var last = Date.now();
+  document.addEventListener('visibilitychange', function(){
+    if (document.visibilityState === 'visible' && Date.now() - last > 600000) {
+      last = Date.now();
+      window.thePostPushHeal();
+    }
+  });
+})();
+""".replace("__VAPID__", "%VAPID%")
+
+@app.get("/push-heal.js")
+async def push_heal_js():
+    js = _HEAL_JS.replace("%VAPID%", VAPID_PUBLIC_KEY if _PUSH_READY else "")
+    return Response(js, media_type="application/javascript", headers={"Cache-Control": "no-cache"})
+
+'''
+swap_between('@app.get("/sw.js")', 'def _stat_row(', SW_BLOCK, "service worker")
+
+rep('</script>\n</body></html>"""',
+    '</script>\n<script src="/push-heal.js"></script>\n</body></html>"""',
+    "shell: heal script")
+
+# ---------------------------------------------------------------------------
+# 7. Settings page JS (these strings sit inside an f-string, so braces are doubled)
+# ---------------------------------------------------------------------------
+rep("""  var sub=await _getSub();
+  if(!sub){{ _setStatus('Not enabled on this device yet.'); return; }}
+  try{{
+    var r=await fetch('/api/push/prefs?endpoint='+encodeURIComponent(sub.endpoint));""",
+    """  if(window.thePostPushHeal){{ try{{ await window.thePostPushHeal(); }}catch(e){{}} }}
+  var sub=await _getSub();
+  if(!sub){{ _setStatus('Not enabled on this device yet.'); return; }}
+  try{{
+    var r=await fetch('/api/push/prefs?endpoint='+encodeURIComponent(sub.endpoint));""",
+    "settings: heal first")
+
+rep("""    }} else {{
+      _setStatus('Not enabled on this device yet.');
+    }}
+  }}catch(e){{ _setStatus('Could not load settings for this device.'); }}""",
+    """    }} else {{
+      // this device is still subscribed in the browser but the server has no record: re-register it
+      var p=_currentPrefs(); p.enabled=true;
+      var rr=await fetch('/api/push/subscribe',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{subscription:sub.toJSON(),prefs:p,resync:true}})}});
+      if(rr.ok){{ document.getElementById('pref-enabled').checked=true; _setStatus('Enabled on this device.'); }}
+      else {{ _setStatus('Not enabled on this device yet.'); }}
+    }}
+  }}catch(e){{ _setStatus('Could not load settings for this device.'); }}""",
+    "settings: no server record")
+
+rep("""    await fetch('/api/push/subscribe',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{subscription:sub.toJSON(),prefs:_currentPrefs()}})}});
+    _setStatus('Enabled on this device.');""",
+    """    var sr=await fetch('/api/push/subscribe',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{subscription:sub.toJSON(),prefs:_currentPrefs()}})}});
+    if(!sr.ok) throw new Error('subscribe failed');
+    try{{ localStorage.setItem('thepost_push_on','1'); localStorage.setItem('thepost_push_prefs',JSON.stringify(_currentPrefs())); }}catch(e){{}}
+    _setStatus('Enabled on this device.');""",
+    "settings: enable")
+
+rep("""    if(sub){{
+      await fetch('/api/push/unsubscribe',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{endpoint:sub.endpoint}})}});
+      await sub.unsubscribe();
+    }}
+    _setStatus('Notifications disabled on this device.');""",
+    """    try{{ localStorage.setItem('thepost_push_on','0'); }}catch(e){{}}
+    if(sub){{
+      var ur=await fetch('/api/push/unsubscribe',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{endpoint:sub.endpoint}})}});
+      if(!ur.ok) throw new Error('server unsubscribe failed');
+      await sub.unsubscribe();
+    }}
+    _setStatus('Notifications disabled on this device.');""",
+    "settings: disable")
+
+rep("""  var sub=await _getSub();
+  if(!sub) return;
+  await fetch('/api/push/prefs',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{endpoint:sub.endpoint,prefs:_currentPrefs()}})}});""",
+    """  var sub=await _getSub();
+  if(!sub) return;
+  try{{ localStorage.setItem('thepost_push_prefs',JSON.stringify(_currentPrefs())); }}catch(e){{}}
+  await fetch('/api/push/prefs',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{endpoint:sub.endpoint,prefs:_currentPrefs()}})}});""",
+    "settings: remember prefs")
+
+rep("loadPushSettings();\n</script>'''",
+    "window.addEventListener('load', function(){{ loadPushSettings(); }});\n</script>'''",
+    "settings: run after load")
+
+# ---------------------------------------------------------------------------
+# write (backup first)
+# ---------------------------------------------------------------------------
+backup = os.path.join(os.path.dirname(os.path.abspath(path)), "server_v8_backup.py")
 if not os.path.exists(backup):
     shutil.copyfile(path, backup)
 out = s.replace("\n", "\r\n") if crlf else s
 open(path, "wb").write(out.encode("utf-8"))
-print(f"Patched {path} to v8. Backup of the old file: {backup}")
+print(f"Patched {path} to v9. Backup of the old file: {backup}")
