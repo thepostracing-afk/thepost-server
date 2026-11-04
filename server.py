@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Post — Live Tips Server  v9 (durable push subs, held tips + Discord page, persistent storage via Upstash Redis, cached silk blobs)"""
+"""The Post - Live Tips Server  v10 (Discord-only tips, hardened jump alerts, durable push subs, persistent storage via Upstash Redis, cached silk blobs)"""
 
 import os, json, datetime, base64, hashlib, asyncio
 from collections import OrderedDict
@@ -15,9 +15,8 @@ try:
     from pywebpush import webpush, WebPushException
     _PUSH_LIB_AVAILABLE = True
 except ImportError:
-    # Lets the whole app boot even if `pywebpush` hasn't been deployed yet —
-    # jump-time notifications just stay off instead of taking the tips
-    # server down. Add `pywebpush` to requirements.txt to enable them.
+    # Lets the whole app boot even if `pywebpush` hasn't been deployed yet.
+    # Add `pywebpush` to requirements.txt to enable jump-time notifications.
     _PUSH_LIB_AVAILABLE = False
     class WebPushException(Exception):
         pass
@@ -28,8 +27,8 @@ try:
     from zoneinfo import ZoneInfo
     NOTIFY_TZ = ZoneInfo("Australia/Melbourne")
 except Exception:
-    # Falls back to fixed AEST (no daylight saving) if the system/tzdata
-    # package isn't available — add `tzdata` to requirements.txt to avoid this.
+    # Falls back to fixed AEST (no daylight saving) if tzdata isn't available.
+    # Add `tzdata` to requirements.txt to avoid this.
     NOTIFY_TZ = datetime.timezone(datetime.timedelta(hours=10))
 
 # --- Web Push / VAPID config (jump-time notifications) ---
@@ -37,8 +36,15 @@ VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_CLAIM_EMAIL = os.environ.get("VAPID_CLAIM_EMAIL", "").strip() or "mailto:admin@example.com"
 NOTIFY_TYPES = ("BACK", "PLACE", "MULTI")
-# Single source of truth for "can we actually send a push right now" — the
-# library has to be installed AND both VAPID keys have to be set.
+# v10: days of the week alerts may go out (0=Mon ... 6=Sun). Default is every day,
+# so a bet on a Tuesday or Thursday can't be missed. Set the env var
+# NOTIFY_DAYS=5 on Render to go back to Saturday only.
+_nd = os.environ.get("NOTIFY_DAYS", "0,1,2,3,4,5,6")
+NOTIFY_DAYS = {int(x) for x in _nd.split(",") if x.strip().isdigit() and 0 <= int(x) <= 6} or set(range(7))
+# v10: an alert is still sent up to this many minutes AFTER the jump time if the
+# server was briefly busy or restarting right when the window opened.
+NOTIFY_GRACE_MIN = 2
+# Single source of truth for "can we actually send a push right now".
 _PUSH_READY = _PUSH_LIB_AVAILABLE and bool(VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY)
 
 PUSH_API_KEY = os.environ.get("PUSH_API_KEY", "thepost2026")
@@ -53,21 +59,19 @@ DEFAULT_STORE = {"tips": [], "analyzer": [], "live": [], "last_push": None, "pus
 
 app = FastAPI(title="The Post", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-# Compresses HTML/JSON responses in transit — meaningfully smaller payloads
-# on mobile data for basically no CPU cost at this traffic scale.
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 ICON_PATH = os.path.join(os.path.dirname(__file__), "thepost.png")
 
 # ---------------------------------------------------------------------------
-# Silk images — single shared component used by both the Tips cards and the
+# Silk images - single shared component used by the Tips cards and the
 # Analyzer tables, so silks look and behave identically everywhere.
 # ---------------------------------------------------------------------------
-SILK_SIZE      = 22   # px — identical size used in every location, tuned for the slimline mobile cards
+SILK_SIZE      = 22
 SILK_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "silk_cache")
 os.makedirs(SILK_CACHE_DIR, exist_ok=True)
-SILK_MEM_CACHE_MAX = 500  # cap in-process entries so a long-running dyno can't grow this unbounded
-_silk_mem_cache = OrderedDict()   # sha1(url) -> (content_type, bytes) — hot in-process cache
+SILK_MEM_CACHE_MAX = 500
+_silk_mem_cache = OrderedDict()   # sha1(url) -> (content_type, bytes)
 
 def _silk_mem_cache_put(key, value):
     _silk_mem_cache[key] = value
@@ -75,15 +79,12 @@ def _silk_mem_cache_put(key, value):
     if len(_silk_mem_cache) > SILK_MEM_CACHE_MAX:
         _silk_mem_cache.popitem(last=False)
 
-# --- Inline (data: URI) silks -------------------------------------------------
-# The desktop app embeds each silk as a base64 data: URI. Pasting that straight
-# into every page means every viewer re-downloads every silk on every load and
-# every auto-reload. Instead, each distinct silk is decoded ONCE, stored here
-# under a short content hash, and served from /s/<hash> with a far-future
-# immutable Cache-Control — so a device downloads each silk once, ever.
+# --- Inline (data: URI) silks ---
+# Each distinct silk is decoded ONCE, stored under a short content hash, and
+# served from /s/<hash> with a far-future immutable Cache-Control.
 SILK_BLOB_MAX = 4000
 _silk_blobs = OrderedDict()      # short hash -> (content_type, bytes)
-_silk_uri_hash = {}              # sha1(data URI string) -> short hash (skips re-decoding)
+_silk_uri_hash = {}              # sha1(data URI string) -> short hash
 
 def _register_data_silk(data_uri):
     """Decode an inline data: URI once and return the short hash it's served
@@ -109,9 +110,8 @@ def _register_data_silk(data_uri):
     return h
 
 def _get_silk_url(d):
-    """Pull whatever silk URL field is present on a tip/horse dict, trying
-    every naming convention the desktop client might push (never generated,
-    never substituted — only ever the real asset's own URL)."""
+    """Pull whatever silk URL field is present on a tip/horse dict (never
+    generated, never substituted - only ever the real asset's own URL)."""
     return (
         d.get("silk_url") or d.get("SilkURL")
         or d.get("silk")     or d.get("Silk")
@@ -120,8 +120,7 @@ def _get_silk_url(d):
 
 def _get_horse_number(d):
     """Pull whatever saddlecloth/runner-number field is present on a tip
-    dict, trying every naming convention the desktop client might push.
-    Returns '' (never a guess) if nothing is there."""
+    dict. Returns '' (never a guess) if nothing is there."""
     for k in ("number", "horse_number", "saddlecloth", "saddlecloth_number",
               "runner_number", "tab_number", "program_number"):
         v = d.get(k)
@@ -130,14 +129,10 @@ def _get_horse_number(d):
     return ""
 
 def _silk_html(url, size=SILK_SIZE):
-    """Render the shared silk component. If no silk is available, render an
-    identically-sized blank slot instead — never a placeholder icon, never a
-    different image."""
+    """Render the shared silk component. No silk = identically-sized blank slot."""
     blank = f'<span class="silk-wrap" style="width:{size}px;height:{size}px;"></span>'
     if not url:
         return blank
-    # Inline data: URIs are decoded once and served from /s/<hash> (cached
-    # forever by the browser). Genuine remote URLs go through the /silk proxy.
     if url.startswith("data:"):
         h = _register_data_silk(url)
         if not h:
@@ -154,12 +149,8 @@ def _silk_html(url, size=SILK_SIZE):
     )
 
 def _fetch_silk_sync(u, disk_path, ext):
-    """All the blocking work for a cache-miss silk (disk read/write + the
-    remote HTTP fetch). Always called via run_in_threadpool so a slow or
-    stalled silk host blocks one worker thread, never the whole event loop —
-    previously this ran directly inside the async route, which meant every
-    other request on the server (tips, dashboard, API calls, other silks)
-    stalled behind it, sometimes for the full 5s timeout."""
+    """All the blocking work for a cache-miss silk. Always called via
+    run_in_threadpool so a slow silk host never stalls the event loop."""
     if os.path.exists(disk_path):
         with open(disk_path, "rb") as f:
             data = f.read()
@@ -177,11 +168,7 @@ def _fetch_silk_sync(u, disk_path, ext):
 
 @app.get("/silk")
 async def silk_proxy(u: str = ""):
-    """Fetch-once, cache-forever proxy for a horse's real silk image. Serves
-    from an in-memory cache first, then an on-disk cache, and only ever
-    downloads a given silk URL once. Never generates or substitutes an image —
-    if the fetch fails, the caller gets a 404 and the front-end leaves the
-    slot blank."""
+    """Fetch-once, cache-forever proxy for a horse's real silk image."""
     if not u:
         raise HTTPException(status_code=404, detail="no silk")
     key = hashlib.sha1(u.encode("utf-8")).hexdigest()
@@ -204,9 +191,7 @@ async def silk_proxy(u: str = ""):
 
 @app.get("/s/{h}")
 async def silk_blob(h: str):
-    """Serves a decoded inline silk by its content hash. The hash is derived
-    from the image bytes, so the URL never changes for the same silk and the
-    browser can cache it for a year."""
+    """Serves a decoded inline silk by its content hash."""
     hit = _silk_blobs.get(h)
     if not hit:
         raise HTTPException(status_code=404, detail="silk unavailable")
@@ -249,34 +234,31 @@ def _load():
         return dict(DEFAULT_STORE)
 
 def _save(s):
-    """Write the store JSON to Upstash."""
+    """Write the store JSON to Upstash (push subscriptions live in their own hash)."""
     if not UPSTASH_URL or not UPSTASH_TOKEN:
         return
     try:
-        # v9: push subscriptions live in their own Redis hash, never in this blob,
-        # so a /push (or a stale process) can no longer wipe them.
         payload = json.dumps({k: v for k, v in s.items() if k != "push_subs"})
-        # Upstash REST SET: POST /set/<key> with raw value as body
         requests.post(f"{UPSTASH_URL}/set/{STORE_KEY}", headers=_headers(), data=payload, timeout=5)
     except Exception:
         pass
 
 # _store is the single in-memory source of truth for every GET route below.
-# /push is the only writer, and it keeps _store and Upstash in lockstep, so
-# there is no need to round-trip to Redis on every page view / API call just
-# to re-read data that hasn't changed — that round trip was previously the
-# single biggest source of per-request latency in this app.
 _store = _load()
-_store.setdefault("push_subs", {})  # older persisted stores may predate this key
-_store.setdefault("discord_tips", [])      # v8
+_store.setdefault("push_subs", {})
+_store.setdefault("discord_tips", [])
 _store.setdefault("discord_updated", None)
 _store.setdefault("tips_updated", None)
 _push_lock = asyncio.Lock()
 
+def _live_tips(store):
+    """v10: the tips shown on the Tips page and Dashboard, returned by /api/tips
+    and used for jump-time alerts are the tips posted to Discord, and nothing
+    else. They stay until the desktop app pushes a new, non-empty Discord board."""
+    return store.get("discord_tips") or []
+
 # ---------------------------------------------------------------------------
-# v9: durable push subscriptions. One Redis hash, one field per device, so
-# adding/removing a device is a single-field write that can never clobber the
-# others, and the tips blob (_save) never contains them.
+# Durable push subscriptions. One Redis hash, one field per device.
 # ---------------------------------------------------------------------------
 SUBS_KEY = STORE_KEY + ":push_subs"
 _subs = {}   # sub_key -> {"subscription":..., "prefs":..., "gone":bool, "fails":int}
@@ -287,8 +269,7 @@ def _redis_cmd(*cmd):
     return r.json().get("result")
 
 def _subs_fetch():
-    """All stored subscriptions, or None if Redis could not be read (never
-    confuse 'could not read' with 'there are none')."""
+    """All stored subscriptions, or None if Redis could not be read."""
     if not UPSTASH_URL or not UPSTASH_TOKEN:
         return None
     try:
@@ -334,8 +315,7 @@ def _subs_del(key):
 
 def _subs_boot():
     """Load subscriptions at startup and migrate any that older versions kept
-    inside the tips blob (only when Redis was readable, so a failed read can
-    never cause a wipe)."""
+    inside the tips blob."""
     fresh = _subs_fetch()
     if fresh is not None:
         _subs.update(fresh)
@@ -350,7 +330,7 @@ def _subs_boot():
                 ok = _subs_put(k, e) and ok
         if ok:
             _store["push_subs"] = {}
-            _save(_store)      # rewrites the blob without push_subs
+            _save(_store)
 
 async def _sync_subs():
     """Adopt what Redis holds (another process may have added/changed devices)."""
@@ -381,20 +361,15 @@ def _push_status(exc):
     return None
 
 def _register_all_silks():
-    """Decode every inline silk currently in the store so /s/<hash> URLs that
-    an already-open page (or a browser cache miss) asks for still resolve
-    after a restart or after newer data is adopted from Upstash."""
+    """Decode every inline silk currently in the store so /s/<hash> URLs
+    still resolve after a restart or after newer data is adopted."""
     try:
-        for t in _store.get("tips", []):
-            for d in [t] + list(t.get("legs") or []):
-                u = _get_silk_url(d)
-                if u.startswith("data:"):
-                    _register_data_silk(u)
-        for t in _store.get("discord_tips", []) or []:
-            for d in [t] + list(t.get("legs") or []):
-                u = _get_silk_url(d)
-                if u.startswith("data:"):
-                    _register_data_silk(u)
+        for key in ("tips", "discord_tips"):
+            for t in _store.get(key, []) or []:
+                for d in [t] + list(t.get("legs") or []):
+                    u = _get_silk_url(d)
+                    if u.startswith("data:"):
+                        _register_data_silk(u)
         for r in _store.get("analyzer", []):
             for h in r.get("horses", []):
                 u = _get_silk_url(h)
@@ -406,11 +381,7 @@ def _register_all_silks():
 _register_all_silks()
 _subs_boot()
 
-# Rendered-HTML cache, keyed by page. Invalidated purely by push_count, which
-# only ever changes inside /push — so this is a safe signal that "the data
-# behind this page changed" and lets us skip rebuilding ~unchanged markup
-# (string-building + f-string formatting over every tip/race/horse) on every
-# single request.
+# Rendered-HTML cache, keyed by page. Invalidated purely by push_count.
 _page_cache = {}
 
 def _cached_page(key, build_fn):
@@ -423,22 +394,11 @@ def _cached_page(key, build_fn):
     return html
 
 # ---------------------------------------------------------------------------
-# Freshness guarantee — every page/API route calls this first.
-#
-# _refresh_store() re-reads Upstash on every request, but ONLY adopts the
-# Upstash copy if its push_count is strictly NEWER (>) than what this
-# process already holds. Using "!=" here was a bug: if a push's write to
-# Upstash lagged or failed, the next request would read Upstash's older
-# copy, see it differed from the correct freshly-pushed local data, and
-# overwrite the correct data with the stale copy. With ">" a successful
-# push can never be undone by a slow/failed Upstash write, while a newer
-# push made by another process/instance is still picked up.
+# Freshness guarantee. Only adopts the Upstash copy if its push_count is
+# strictly NEWER (>) than what this process already holds.
 # ---------------------------------------------------------------------------
 async def _refresh_store():
     if not (UPSTASH_URL and UPSTASH_TOKEN):
-        # Nothing to refresh from (e.g. local dev with no Redis configured)
-        # — the in-memory _store this process built from /push calls is
-        # already the only copy of the truth, so leave it alone.
         return
     try:
         fresh = await run_in_threadpool(_load)
@@ -446,8 +406,6 @@ async def _refresh_store():
         return
     if fresh.get("push_count", 0) > _store.get("push_count", 0):
         async with _push_lock:
-            # Re-check inside the lock: a /push may have landed while we
-            # were fetching from Upstash.
             if fresh.get("push_count", 0) > _store.get("push_count", 0):
                 _store.clear()
                 _store.update(fresh)
@@ -455,9 +413,9 @@ async def _refresh_store():
                 _register_all_silks()
 
 # ---------------------------------------------------------------------------
-# Jump-time push notifications — BACK/PLACE/MULTI tips only, Saturdays only.
+# Jump-time push notifications for the tips posted to Discord.
 # ---------------------------------------------------------------------------
-_notified = set()  # (sub_key, tip_id) already sent this run — in-memory only
+_notified = set()  # (sub_key, tip_id) already sent - in-memory fallback
 
 def _sub_key(endpoint):
     return hashlib.sha1((endpoint or "").encode("utf-8")).hexdigest()[:16]
@@ -475,8 +433,7 @@ def _tip_id(t):
 
 def _jump_dt_today(time_str, now):
     """Turn a race's raw time string into a concrete datetime for `now`'s
-    date, reusing the same AM/PM inference _time_key already uses elsewhere
-    so notification timing always matches what the Analyzer countdown shows."""
+    date, using the same AM/PM inference as _time_key."""
     minutes = _time_key(time_str)
     if minutes is None or minutes >= 99999:
         return None
@@ -493,41 +450,86 @@ def _send_push_sync(subscription, payload):
         vapid_claims={"sub": VAPID_CLAIM_EMAIL},
     )
 
+def _tip_day(t, store):
+    """The date a tip is for (YYYY-MM-DD). Falls back to the day it was posted
+    to Discord; '' if the server has no date at all (treated as today)."""
+    rd = str(t.get("race_date") or "").strip()[:10]
+    if not rd:
+        rd = str(t.get("sent_at") or store.get("discord_updated") or "").strip()[:10]
+    return rd
+
+def _claim_send_sync(sub_key, tip_id):
+    """True if this device has not been sent this tip yet. A Redis key (SET NX,
+    24h expiry) means a restart or a second instance can't double-send; the
+    in-memory set is the fallback if Redis can't be reached."""
+    if (sub_key, tip_id) in _notified:
+        return False
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            if _redis_cmd("SET", f"{STORE_KEY}:sent:{sub_key}:{tip_id}", "1", "NX", "EX", 86400) is None:
+                return False
+        except Exception as e:
+            print(f"[notify] dedupe check failed, using memory only: {e}")
+    _notified.add((sub_key, tip_id))
+    return True
+
+def _release_send_sync(sub_key, tip_id):
+    """Give the claim back after a failed send so the next tick retries."""
+    _notified.discard((sub_key, tip_id))
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            _redis_cmd("DEL", f"{STORE_KEY}:sent:{sub_key}:{tip_id}")
+        except Exception:
+            pass
+
 async def _notify_tick():
     if not _PUSH_READY:
-        return  # push not configured (or pywebpush not installed) — nothing to do
+        return  # push not configured (or pywebpush not installed) - nothing to do
     now = datetime.datetime.now(NOTIFY_TZ)
-    if now.weekday() != 5:  # Saturday only — hard rule, no exceptions
+    if now.weekday() not in NOTIFY_DAYS:
         return
-    await _sync_subs()
-    subs = [(k, e) for k, e in _subs.items() if not e.get("gone")]
-    if not subs:
-        return
-    for t in _store.get("tips", []):
+    today = now.date().isoformat()
+
+    # Work out which Discord tips are close to the jump BEFORE touching Redis,
+    # so a quiet day costs no Upstash commands.
+    due = []
+    for t in _live_tips(_store):
         ttype = t.get("type")
         if ttype not in NOTIFY_TYPES:
             continue
-        rd = t.get("race_date")
-        if rd and rd != now.date().isoformat():
-            continue   # v8: a tip moved to another day must not alert today
+        day = _tip_day(t, _store)
+        if day and day != today:
+            continue   # a tip for another day must never alert today
         jump = _jump_dt_today(t.get("time", ""), now)
         if not jump:
             continue
         mins_out = (jump - now).total_seconds() / 60.0
+        if mins_out < -NOTIFY_GRACE_MIN or mins_out > 60:
+            continue
+        due.append((t, ttype, mins_out))
+    if not due:
+        return
+
+    await _sync_subs()
+    subs = [(k, e) for k, e in _subs.items() if not e.get("gone")]
+    if not subs:
+        return
+
+    for t, ttype, mins_out in due:
         tid = _tip_id(t)
         if ttype == "MULTI":
             legs = t.get("legs", []) or []
             first_leg = legs[0] if legs else {}
             silk = _get_silk_url(first_leg)
             horse_label = f'{len(legs)}-Leg Multi'
-            track_label = first_leg.get("track", t.get("track",""))
-            race_label  = first_leg.get("race", t.get("race",""))
+            track_label = first_leg.get("track", t.get("track", ""))
+            race_label  = first_leg.get("race", t.get("race", ""))
         else:
             silk = _get_silk_url(t)
             number = _get_horse_number(t)
             horse_label = f'{number}. {t.get("horse","")}' if number != "" else t.get("horse", "")
-            track_label = t.get("track","")
-            race_label  = t.get("race","")
+            track_label = t.get("track", "")
+            race_label  = t.get("race", "")
         if silk and silk.startswith("data:"):
             _h = _register_data_silk(silk)
             icon = f"/s/{_h}" if _h else "/icon.png"
@@ -535,6 +537,19 @@ async def _notify_tick():
             icon = f"/silk?u={quote(silk, safe='')}"
         else:
             icon = "/icon.png"
+        when = "jumping now" if mins_out < 0.5 else f"{round(mins_out)} min to jump"
+        price = t.get("combined_odds") if ttype == "MULTI" else t.get("real_odds")
+        try:
+            price_txt = f' \u00b7 ${float(price):.2f}' if price else ""
+        except (TypeError, ValueError):
+            price_txt = ""
+        payload = {
+            "title": f'{race_label if (track_label and str(race_label).startswith(str(track_label))) else (str(track_label) + " " + str(race_label)).strip()} \u2014 {when}',
+            "body": f'{horse_label} \u00b7 {ttype.title()} \u00b7 {_dc_f(t.get("units"), 1):g}u{price_txt}',
+            "icon": icon,
+            "tag": tid,
+            "url": "/tips",
+        }
         for key, entry in subs:
             prefs = entry.get("prefs", {})
             if not prefs.get("enabled", True):
@@ -544,42 +559,34 @@ async def _notify_tick():
             if ttype == "MULTI" and not prefs.get("multi", True):
                 continue
             lead = prefs.get("minutes_before", 5)
-            if not (0 <= mins_out <= lead):
+            if mins_out > lead:
                 continue
-            dedupe = (key, tid)
-            if dedupe in _notified:
+            if not await run_in_threadpool(_claim_send_sync, key, tid):
                 continue
-            payload = {
-                "title": f'{track_label} {race_label} \u2014 {max(0, round(mins_out))} min to jump',
-                "body": f'{horse_label} \u00b7 {ttype.title()} \u00b7 {int(t.get("units",1))}u',
-                "icon": icon,
-                "tag": tid,
-                "url": "/tips",
-            }
             try:
                 await run_in_threadpool(_send_push_sync, entry["subscription"], payload)
-                _notified.add(dedupe)
                 if entry.get("fails") or entry.get("gone"):
                     entry["fails"] = 0
                     entry.pop("gone", None)
                     await run_in_threadpool(_subs_put, key, entry)
             except Exception as e:
-                # v9: a failed send NEVER deletes a subscription. 404/410 just marks
-                # it gone (the device replaces it itself next time the app opens).
+                # A failed send NEVER deletes a subscription. 404/410 marks it gone
+                # (the device replaces it itself next time the app opens). Any other
+                # failure gives the claim back so the next 20s tick retries while the
+                # jump window is still open.
                 code = _push_status(e)
                 if code in (404, 410):
                     entry["gone"] = True
                 else:
                     entry["fails"] = int(entry.get("fails", 0) or 0) + 1
+                    await run_in_threadpool(_release_send_sync, key, tid)
                 entry["last_error"] = f"{type(e).__name__}: {str(e)[:160]}"
                 print(f"[notify] send failed for {key}: status={code} {entry['last_error']}")
                 await run_in_threadpool(_subs_put, key, entry)
 
 @app.on_event("startup")
 async def _start_background_sync():
-    """Belt-and-braces: re-pull from Upstash every 45s in the background so
-    the in-memory store self-heals if this process restarts elsewhere or
-    another instance pushes — without making every request pay for it.
+    """Re-pull from Upstash every 45s so the in-memory store self-heals.
     Only ever adopts Upstash data that is strictly newer (>) than local."""
     async def _loop():
         while True:
@@ -600,9 +607,7 @@ async def _start_background_sync():
 
 @app.on_event("startup")
 async def _start_notify_loop():
-    """Checks every 20s whether any tip has crossed into its notification
-    window. Cheap (in-memory only) and safe to run often — the Saturday
-    check and per-tip dedupe happen inside _notify_tick()."""
+    """Checks every 20s whether any tip has crossed into its notification window."""
     async def _loop():
         while True:
             await asyncio.sleep(20)
@@ -610,6 +615,27 @@ async def _start_notify_loop():
                 await _notify_tick()
             except Exception:
                 pass
+    asyncio.create_task(_loop())
+
+@app.on_event("startup")
+async def _start_keepalive():
+    """A free Render instance sleeps after ~15 min with no traffic, and a
+    sleeping server cannot send alerts. Once it's awake this pings its own
+    public URL every 10 min so it stays awake. (Render sets RENDER_EXTERNAL_URL
+    itself.) It cannot wake itself, so also point a free uptime monitor at
+    /healthz every 5 min as a backstop."""
+    base = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not base:
+        return
+    def _ping():
+        try:
+            requests.get(base + "/healthz", timeout=10)
+        except Exception:
+            pass
+    async def _loop():
+        while True:
+            await asyncio.sleep(600)
+            await run_in_threadpool(_ping)
     asyncio.create_task(_loop())
 
 @app.post("/push")
@@ -621,36 +647,27 @@ async def push(request: Request, x_api_key: str = Header(default="")):
         new_tips     = body.get("tips",[])
         new_analyzer = body.get("analyzer",[])
         new_live     = body.get("live",[])
-        new_pnl      = body.get("pnl")  # today's P&L from the desktop app (None if not sent)
-        # v8: tips only change when the desktop app commits them (a Discord send or
-        # "Push tips to server now"). Builds that don't send the flag always commit.
+        new_pnl      = body.get("pnl")
         tips_commit  = bool(body.get("tips_commit", True))
         new_discord  = body.get("discord_tips")   # None = not sent, list = the whole Discord board
-        # Defense in depth: refuse an entirely empty payload if we're
-        # already holding real data. A genuinely empty day still has
-        # analyzer races (the CSVs were scanned), so tips AND analyzer
-        # both empty only ever happens from a transient client-side glitch
-        # (a reload racing a push) — never let that silently wipe the
-        # board for every viewer. The desktop app also guards against
-        # sending this in the first place; this is the backstop in case
-        # it or some other client ever doesn't.
+        # Refuse an entirely empty payload if we're already holding real data.
         is_suspicious_empty = (
             not new_analyzer and (not tips_commit or not new_tips)
             and (_store.get("tips") or _store.get("analyzer"))
         )
         if is_suspicious_empty:
-            # Still accept a changed P&L (e.g. a bet was just marked while the
-            # bet lists were momentarily empty) — it never touches tips.
             changed = False
             if isinstance(new_pnl, dict) and new_pnl != _store.get("pnl"):
                 _store["pnl"] = new_pnl
                 changed = True
-            if isinstance(new_discord, list) and new_discord != _store.get("discord_tips"):
+            # v10: an empty Discord list never clears the board
+            if isinstance(new_discord, list) and new_discord and new_discord != _store.get("discord_tips"):
                 _store["discord_tips"] = new_discord
                 _store["discord_updated"] = datetime.datetime.now().isoformat()
                 changed = True
             if changed:
                 _store["push_count"] += 1
+                _register_all_silks()
                 await run_in_threadpool(_save, _store)
             return {
                 "status": "rejected", "reason": "empty payload ignored, kept previous data",
@@ -660,7 +677,7 @@ async def push(request: Request, x_api_key: str = Header(default="")):
         if tips_commit:
             _store["tips"]         = new_tips
             _store["tips_updated"] = body.get("generated_at") or datetime.datetime.now().isoformat()
-        if isinstance(new_discord, list):
+        if isinstance(new_discord, list) and new_discord:   # v10: an empty list never clears the board
             if new_discord != _store.get("discord_tips"):
                 _store["discord_updated"] = datetime.datetime.now().isoformat()
             _store["discord_tips"] = new_discord
@@ -670,19 +687,15 @@ async def push(request: Request, x_api_key: str = Header(default="")):
             _store["pnl"] = new_pnl
         _store["last_push"]   = body.get("generated_at") or datetime.datetime.now().isoformat()
         _store["push_count"] += 1
-        # Decode any new inline silks now, so /s/<hash> is ready before the
-        # first viewer's page (or its auto-reload) asks for it.
         _register_all_silks()
-        # Offloaded to a thread so the Upstash write (a blocking `requests`
-        # call) never stalls the event loop that's serving everyone else.
         await run_in_threadpool(_save, _store)
-    return {"status":"ok","tips":len(_store["tips"]),"analyzer_races":len(_store["analyzer"]),"live_races":len(_store["live"]),
+    return {"status":"ok","tips":len(_live_tips(_store)),"analyzer_races":len(_store["analyzer"]),"live_races":len(_store["live"]),
             "tips_committed":tips_commit,"discord_tips":len(_store.get("discord_tips") or [])}
 
 @app.get("/api/tips")
 async def api_tips():
     await _refresh_store()
-    return JSONResponse(_store["tips"])
+    return JSONResponse(_live_tips(_store))
 
 @app.get("/api/analyzer")
 async def api_analyzer():
@@ -692,7 +705,48 @@ async def api_analyzer():
 @app.get("/api/status")
 async def api_status():
     await _refresh_store()
-    return {"last_push":_store["last_push"],"push_count":_store["push_count"],"tips":len(_store["tips"]),"analyzer_races":len(_store["analyzer"])}
+    return {"last_push":_store["last_push"],"push_count":_store["push_count"],"tips":len(_live_tips(_store)),"analyzer_races":len(_store["analyzer"])}
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+@app.get("/api/push/status")
+async def push_status_api():
+    """Open this in a browser to check alerts are live: it shows whether push is
+    configured, how many devices are registered, and which tips would alert."""
+    await _refresh_store()
+    await _sync_subs()
+    now = datetime.datetime.now(NOTIFY_TZ)
+    today = now.date().isoformat()
+    active = [e for e in _subs.values() if not e.get("gone") and (e.get("prefs") or {}).get("enabled", True)]
+    upcoming = []
+    for t in _live_tips(_store):
+        if t.get("type") not in NOTIFY_TYPES:
+            continue
+        day = _tip_day(t, _store)
+        jump = _jump_dt_today(t.get("time", ""), now)
+        upcoming.append({
+            "horse": t.get("horse") or "Multi",
+            "type": t.get("type"),
+            "time": t.get("time", ""),
+            "race_day": day or "unknown",
+            "alerts_today": bool((not day or day == today) and jump is not None),
+            "minutes_to_jump": round((jump - now).total_seconds() / 60.0) if jump else None,
+        })
+    return {
+        "push_ready": _PUSH_READY,
+        "pywebpush_installed": _PUSH_LIB_AVAILABLE,
+        "vapid_keys_set": bool(VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY),
+        "devices_registered": len(_subs),
+        "devices_active": len(active),
+        "devices_dead": len([e for e in _subs.values() if e.get("gone")]),
+        "alert_days": sorted(NOTIFY_DAYS),
+        "today_is_alert_day": now.weekday() in NOTIFY_DAYS,
+        "server_time": now.isoformat(timespec="seconds"),
+        "tips_on_board": len(_live_tips(_store)),
+        "tips": upcoming,
+    }
 
 # ---------------------------------------------------------------------------
 # Push subscription management (Settings page)
@@ -757,7 +811,6 @@ async def push_subscribe(request: Request):
         raise HTTPException(status_code=503, detail="Could not save subscription, try again")
     _subs[key] = entry
     if old_entry is not None and old_key:
-        # The device explicitly replaced this subscription with a new one.
         _subs.pop(old_key, None)
         await run_in_threadpool(_subs_del, old_key)
     return {"status": "ok"}
@@ -834,6 +887,9 @@ self.addEventListener('push', function(event){
     icon: data.icon || '/icon.png',
     badge: '/icon.png',
     tag: data.tag || undefined,
+    renotify: !!data.tag,
+    requireInteraction: true,
+    vibrate: [200, 100, 200],
     data: { url: data.url || '/' }
   };
   event.waitUntil(self.registration.showNotification(title, options));
@@ -841,7 +897,16 @@ self.addEventListener('push', function(event){
 self.addEventListener('notificationclick', function(event){
   event.notification.close();
   var url = (event.notification.data && event.notification.data.url) || '/';
-  event.waitUntil(clients.openWindow(url));
+  event.waitUntil(clients.matchAll({type: 'window', includeUncontrolled: true}).then(function(list){
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i];
+      if ('focus' in c) {
+        if ('navigate' in c) { try { c.navigate(url); } catch(e) {} }
+        return c.focus();
+      }
+    }
+    return clients.openWindow(url);
+  }));
 });
 // The browser rotated or dropped this device's subscription: get a new one and
 // tell the server, which carries the device's settings over to it.
@@ -967,8 +1032,7 @@ def _fmt_odds(v):
         return ""
 
 def _horse_detail_html(h):
-    """Full stat rundown for one horse — every field the desktop model tracks,
-    laid out as a compact grid. Missing/zero fields are simply omitted."""
+    """Full stat rundown for one horse. Missing/zero fields are simply omitted."""
     starts_line = ""
     cs, cw, cp = h.get("career_starts",""), h.get("career_wins",""), h.get("career_places","")
     if cs not in ("", 0, None):
@@ -1037,13 +1101,26 @@ def _pushed_str(store):
     except: return "Never"
 
 def _tips_sent_str(store):
-    """When the tips were last sent (tips are held between Discord sends)."""
-    try: return datetime.datetime.fromisoformat(store.get("tips_updated") or store["last_push"]).strftime("%d %b  %H:%M")
+    """When the Discord tips were last posted."""
+    try: return datetime.datetime.fromisoformat(store.get("discord_updated") or store.get("tips_updated") or store["last_push"]).strftime("%d %b  %H:%M")
     except: return "Never"
 
+def _dc_f(v, default=0.0):
+    try: return float(v)
+    except (TypeError, ValueError): return default
+
+def _dc_day_prefix(t):
+    """'SAT 07 NOV - ' in front of a tip's time when it is not for today."""
+    try:
+        d = datetime.date.fromisoformat(t.get("race_date", ""))
+        if d != datetime.datetime.now(NOTIFY_TZ).date():
+            return d.strftime("%a %d %b").upper() + " &middot; "
+    except Exception:
+        pass
+    return ""
+
 def _race_id(r):
-    """Stable id for a race, independent of list ordering/sort, so links can
-    point at a specific race regardless of which sort is applied server-side."""
+    """Stable id for a race, independent of list ordering/sort."""
     raw = f'{r.get("track","")}|{r.get("race","")}|{r.get("time","")}'
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
 
@@ -1051,7 +1128,7 @@ def _time_key(tstr):
     """Numeric sort key for race times.
     Assumes:
       - 11:xx and 12:xx are before 1 PM.
-      - 1:xx–10:xx are afternoon races (13:xx–22:xx) unless AM/PM is specified.
+      - 1:xx-10:xx are afternoon races (13:xx-22:xx) unless AM/PM is specified.
     """
     try:
         t = str(tstr).strip().upper()
@@ -1064,22 +1141,17 @@ def _time_key(tstr):
         h = int(parts[0])
         m = int(parts[1][:2]) if len(parts) > 1 else 0
 
-        # Convert 1:00–10:59 to afternoon
         if 1 <= h <= 10:
             h += 12
 
-        # Leave 11:xx and 12:xx unchanged
         return h * 60 + m
 
     except Exception:
         return 99999.0
 
 def _poll_script(push_count, page_id):
-    """Replaces a blind full-page reload every 90s with a cheap status poll
-    every 20s (now nearly free since /api/status reads straight from
-    memory). Only reloads when push_count actually changed, and stashes
-    scroll position / active tab / open accordion rows first so a real
-    update doesn't feel like the page just kicked you back to the top."""
+    """Cheap status poll every 20s; only reloads when push_count changed, and
+    stashes scroll position / active tab / open rows first."""
     if page_id == "watch":
         return ""
     return """
@@ -1131,7 +1203,7 @@ def _poll_script(push_count, page_id):
 
 def _shell(page_id, body, store, friend=False):
     pushed = _pushed_str(store)
-    total  = len(store.get("discord_tips") or []) if page_id == "discord" else len(store["tips"])
+    total  = len(_live_tips(store))
     share_btn = '<button class="sbtn" onclick="openShare()">&#x2197; Share</button>' if page_id=="tips" else ""
     export_btn = '<button class="sbtn ebtn" onclick="exportPhoto()">&#x1F4F7; Export</button>' if page_id=="tips" else ""
     return """<!DOCTYPE html>
@@ -1346,12 +1418,10 @@ input:checked + .slider:before{transform:translateX(18px);background:var(--green
 <nav class="navbar">
 """ + ("""  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/portal/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
   <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/portal/tips'"><span class="ni">&#x1F3C7;</span>Tips</button>
-  <button class="nbtn """ + ("active" if page_id=="discord" else "") + """ " onclick="location.href='/portal/discord'"><span class="ni">&#x1F4E8;</span>Discord</button>
   <button class="nbtn """ + ("active" if page_id=="watch" else "") + """ " onclick="location.href='/portal/watch'"><span class="ni">&#x1F4FA;</span>Watch</button>
   <button class="nbtn """ + ("active" if page_id=="settings" else "") + """ " onclick="location.href='/settings'"><span class="ni">&#x2699;&#xFE0F;</span>Settings</button>
 """ if friend else """  <button class="nbtn """ + ("active" if page_id=="dash" else "") + """ " onclick="location.href='/dash'"><span class="ni">&#x1F4CA;</span>Dashboard</button>
   <button class="nbtn """ + ("active" if page_id=="tips" else "") + """ " onclick="location.href='/tips'"><span class="ni">&#x1F3C7;</span>Tips</button>
-  <button class="nbtn """ + ("active" if page_id=="discord" else "") + """ " onclick="location.href='/discord'"><span class="ni">&#x1F4E8;</span>Discord</button>
   <button class="nbtn """ + ("active" if page_id=="analyzer" else "") + """ " onclick="location.href='/analyzer'"><span class="ni">&#x1F50D;</span>Analyzer</button>
   <button class="nbtn """ + ("active" if page_id=="watch" else "") + """ " onclick="location.href='/watch'"><span class="ni">&#x1F4FA;</span>Watch</button>
   <button class="nbtn """ + ("active" if page_id=="settings" else "") + """ " onclick="location.href='/settings'"><span class="ni">&#x2699;&#xFE0F;</span>Settings</button>
@@ -1433,10 +1503,9 @@ function sortAnalyzer(key,btn){
 }
 
 // ---------------------------------------------------------------------------
-// Export Photo — renders the current tab's tips into an offscreen replica of
-// the tips page (same cards, styling) but with the RSI and VALUE stats
-// stripped out of each card and the header swapped for the app logo, then
-// rasterizes it to a PNG the user can save or share.
+// Export Photo - renders the current tab's tips into an offscreen replica of
+// the tips page with the RSI and VALUE stats stripped out of each card and the
+// header swapped for the app logo, then rasterizes it to a PNG.
 // ---------------------------------------------------------------------------
 var _logoCutoutCache=null;
 function _isIOS(){
@@ -1444,9 +1513,6 @@ function _isIOS(){
     (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
 }
 function _isCanvasBlank(canvas){
-  // Safari's foreignObject render path occasionally succeeds but paints
-  // nothing (a known WebKit quirk) rather than throwing — sample a spread
-  // of pixels' alpha channel to catch that case so we can fall back.
   try{
     var ctx=canvas.getContext('2d');
     var d=ctx.getImageData(0,0,canvas.width,canvas.height).data;
@@ -1455,11 +1521,8 @@ function _isCanvasBlank(canvas){
   }catch(e){ return false; }
 }
 function _seamlessLogo(){
-  // The source /icon.png is a solid-black square with a white mark on it.
-  // Rather than paste that black square onto the app's dark-navy (--bg)
-  // background — which leaves a visible seam — key the black out into real
-  // transparency (alpha = luminance) so the mark just floats on whatever's
-  // behind it, seamlessly, regardless of the exact background colour.
+  // Keys the black square of /icon.png out into real transparency
+  // (alpha = luminance) so the mark floats on the dark background.
   if(_logoCutoutCache) return Promise.resolve(_logoCutoutCache);
   return new Promise(function(resolve){
     var img=new Image();
@@ -1488,9 +1551,7 @@ function _seamlessLogo(){
 }
 
 function _loadHtml2Canvas(){
-  // Loaded on demand (only when Export is actually tapped) instead of on
-  // every single page view — dash/analyzer/watch never used it anyway, and
-  // this trims a non-trivial chunk of JS off every page's initial load.
+  // Loaded on demand (only when Export is actually tapped).
   if(typeof html2canvas!=='undefined') return Promise.resolve();
   if(window._h2cLoadPromise) return window._h2cLoadPromise;
   window._h2cLoadPromise=new Promise(function(resolve,reject){
@@ -1504,7 +1565,7 @@ function _loadHtml2Canvas(){
 }
 function exportPhoto(){
   _loadHtml2Canvas().then(_runExportPhoto).catch(function(){
-    alert('Export library failed to load — check your connection.');
+    alert('Export library failed to load - check your connection.');
   });
 }
 function _runExportPhoto(){
@@ -1518,8 +1579,6 @@ function _runExportPhoto(){
   clone.classList.add('active');
 
   // Strip RSI + VALUE stat tiles from every card, then rebalance the grid.
-  // Silk images are kept — just forced to load eagerly so they're actually
-  // painted in by the time html2canvas rasterizes the page.
   clone.querySelectorAll('.card').forEach(function(card){
     card.querySelectorAll('.stat').forEach(function(s){
       var sl=s.querySelector('.sl');
@@ -1572,10 +1631,7 @@ function _runExportPhoto(){
   var exportChain=_seamlessLogo().then(function(logoSrc){
     logoImg.src=logoSrc;
 
-    // Wait for every image (logo + silks) to actually finish loading —
-    // cloned <img> tags don't carry over the "already loaded" state, so
-    // capturing immediately would rasterize blank slots. Each image gets a
-    // hard 3s cap so one stuck/broken image can't stall the whole export.
+    // Wait for every image (logo + silks) to finish loading, with a 3s cap each.
     var imgs=[].slice.call(page.querySelectorAll('img'));
     return Promise.all(imgs.map(function(img){
       if(img.complete && img.naturalWidth>0) return Promise.resolve();
@@ -1588,17 +1644,8 @@ function _runExportPhoto(){
       });
     }));
   }).then(function(){
-    // useCORS forces a fresh crossOrigin fetch even for images the browser
-    // already has cached (silks are same-origin /s/<hash> images now, and the
-    // logo/icon is same-origin) — dropping it avoids a redundant re-download.
-    //
-    // iOS Safari's canvas engine reconstructs every border-radius/box-shadow
-    // by hand in html2canvas's default renderer, which is dramatically
-    // slower than on Chrome/Android for card-heavy markup like this. Safari
-    // supports rendering via an SVG <foreignObject> instead, which lets
-    // WebKit's own (fast) native renderer do that work — so we try that
-    // first on iOS, with an automatic fallback to the default renderer if
-    // it comes back blank (a known occasional WebKit quirk).
+    // iOS Safari: try the native foreignObject renderer first, falling back to
+    // the default renderer if it comes back blank.
     var bg=getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()||'#0B0F14';
     var iOS=_isIOS();
     var baseOpts={backgroundColor:bg,logging:false,imageTimeout:4000,scale:iOS?1.25:1.5};
@@ -1608,7 +1655,6 @@ function _runExportPhoto(){
       if(iOS && _isCanvasBlank(canvas)) return html2canvas(page,baseOpts);
       return canvas;
     }).catch(function(){
-      // foreignObjectRendering threw outright — standard renderer as fallback.
       return html2canvas(page,baseOpts);
     });
   }).then(function(canvas){
@@ -1620,9 +1666,7 @@ function _runExportPhoto(){
     });
   });
 
-  // Hard ceiling on the whole process — if anything upstream (a stuck
-  // image, an html2canvas edge case) never resolves, this fires anyway so
-  // the user gets an error and their UI back instead of a frozen toast.
+  // Hard ceiling on the whole process so a stuck image can't freeze the toast.
   var watchdog=new Promise(function(_,reject){
     setTimeout(function(){ reject(new Error('export-timeout')); },22000);
   });
@@ -1648,9 +1692,9 @@ function _runExportPhoto(){
     stage.innerHTML='';
     toast.style.display='none';
     if(err && err.message==='export-timeout'){
-      alert('Export took too long and was cancelled — please try again.');
+      alert('Export took too long and was cancelled - please try again.');
     } else {
-      alert('Export failed — please try again.');
+      alert('Export failed - please try again.');
     }
   });
 }
@@ -1666,10 +1710,11 @@ def _cards_js(tips_list, label, container_id, odds_label="ODDS"):
     for t in tips_list:
         tag_val = t.get("tag") or ""
         cls = tag_val.lower().replace(" ","-")
-        # SECONDARY and TOP PLAY badges are hidden per your call — WATCH
-        # (and anything else) still shows.
+        # SECONDARY and TOP PLAY badges are hidden - WATCH (and anything else) still shows.
         tag_html = f'<span class="tag {cls}">{tag_val}</span>' if tag_val and tag_val not in ("TOP PLAY", "SECONDARY") else ""
         vc  = "pos" if t.get("value_pct",0)>0 else "neg"
+        number = _get_horse_number(t)
+        horse_label = f'{number}. {t.get("horse","")}' if number != "" else t.get("horse","")
         out += (
             f'<div class="card sortable-card"'
             f' data-time="{t.get("time","")}"'
@@ -1680,24 +1725,21 @@ def _cards_js(tips_list, label, container_id, odds_label="ODDS"):
             f' data-rsi="{t.get("rsi",0)}"'
             f' data-real_odds="{t.get("real_odds",0)}"'
             f' data-horse="{t.get("horse","")}">'
-            f'<div class="ctop"><span class="horse-row">{_silk_html(_get_silk_url(t))}<span class="horse">{t.get("horse","")}</span></span>{tag_html}</div>'
-            f'<div class="meta">{t.get("time","")} &middot; {t.get("track","")} &middot; {t.get("race","")}</div>'
+            f'<div class="ctop"><span class="horse-row">{_silk_html(_get_silk_url(t))}<span class="horse">{horse_label}</span></span>{tag_html}</div>'
+            f'<div class="meta">{_dc_day_prefix(t)}{t.get("time","")} &middot; {t.get("track","")} &middot; {t.get("race","")}</div>'
             f'<div class="stats">'
-            f'<div class="stat"><span class="sl">{odds_label}</span><span class="sv">${t.get("real_odds",0):.2f}</span></div>'
-            f'<div class="stat"><span class="sl">UNITS</span><span class="sv">{int(t.get("units",1))}u</span></div>'
-            f'<div class="stat"><span class="sl">VALUE</span><span class="sv {vc}">{t.get("value_pct",0):+.1f}%</span></div>'
-            f'<div class="stat"><span class="sl">RSI</span><span class="sv">{int(t.get("rsi",0))}</span></div>'
-            f'<div class="stat"><span class="sl">WIN%</span><span class="sv">{t.get("win_pct",0):.1f}%</span></div>'
+            f'<div class="stat"><span class="sl">{odds_label}</span><span class="sv">${_dc_f(t.get("real_odds")):.2f}</span></div>'
+            f'<div class="stat"><span class="sl">UNITS</span><span class="sv">{_dc_f(t.get("units"), 1):g}u</span></div>'
+            f'<div class="stat"><span class="sl">VALUE</span><span class="sv {vc}">{_dc_f(t.get("value_pct")):+.1f}%</span></div>'
+            f'<div class="stat"><span class="sl">RSI</span><span class="sv">{int(_dc_f(t.get("rsi")))}</span></div>'
+            f'<div class="stat"><span class="sl">WIN%</span><span class="sv">{_dc_f(t.get("win_pct")):.1f}%</span></div>'
             f'</div></div>'
         )
     out += "</div>"
     return out
 
 # ---------------------------------------------------------------------------
-# Multi cards — a multi bet chains several race legs into one parlay, so it
-# gets its own nicely laid-out card: one compact row per leg (silk, horse,
-# where/when, leg odds) and a two-tile footer for the combined price + stake,
-# instead of forcing it into the single-horse stat-grid used by Back/Place.
+# Multi cards - one compact row per leg and a two-tile footer.
 # ---------------------------------------------------------------------------
 
 def _multi_leg_html(leg):
@@ -1721,7 +1763,7 @@ def _multi_card_html(t):
     tag_html = f'<span class="tag {tag_cls}">{t["tag"]}</span>' if t.get("tag") else ""
     legs_html = "".join(_multi_leg_html(l) for l in legs)
     combined = float(t.get("combined_odds", 0) or 0)
-    units = t.get("units", 1)
+    units = _dc_f(t.get("units"), 1)
     tracks = ", ".join(dict.fromkeys(l.get("track","") for l in legs if l.get("track")))
     first_time = legs[0].get("time","") if legs else t.get("time","")
     title = f'{len(legs)}-Leg Multi' if legs else "Multi"
@@ -1736,11 +1778,11 @@ def _multi_card_html(t):
         f' data-real_odds="{combined}"'
         f' data-horse="{title}">'
         f'<div class="ctop"><span class="horse-row"><span class="horse">{title}</span></span>{tag_html}</div>'
-        f'<div class="meta">{tracks}</div>'
+        f'<div class="meta">{_dc_day_prefix(t)}{tracks}</div>'
         f'<div class="multi-legs">{legs_html}</div>'
         '<div class="multi-foot">'
         f'<div class="mf-item"><span class="sl">COMBINED ODDS</span><span class="sv">${combined:.2f}</span></div>'
-        f'<div class="mf-item"><span class="sl">UNITS</span><span class="sv">{int(units)}u</span></div>'
+        f'<div class="mf-item"><span class="sl">UNITS</span><span class="sv">{units:g}u</span></div>'
         '</div>'
         '</div>'
     )
@@ -1755,12 +1797,12 @@ def _cards_multi_js(tips_list):
     return out
 
 def _tips_body(store):
-    tips  = store["tips"]
-    back  = sorted([t for t in tips if t["type"]=="BACK"],  key=lambda t: t.get("track",""))
-    place = sorted([t for t in tips if t["type"]=="PLACE"], key=lambda t: t.get("track",""))
+    tips  = _live_tips(store)
+    back  = sorted([t for t in tips if t.get("type")=="BACK"],  key=lambda t: t.get("track",""))
+    place = sorted([t for t in tips if t.get("type")=="PLACE"], key=lambda t: t.get("track",""))
     multi = sorted(
-        [t for t in tips if t["type"]=="MULTI"],
-        key=lambda t: -(t.get("avg_rsi",0) or 0)
+        [t for t in tips if t.get("type")=="MULTI"],
+        key=lambda t: -(_dc_f(t.get("avg_rsi")))
     )
     sort_bar = (
         '<div class="sortbar">'
@@ -1798,141 +1840,23 @@ def _tips_body(store):
         '</script>'
     )
 
-# ---------------------------------------------------------------------------
-# Discord tips (v8) — exactly what the desktop app posted to Discord: the price,
-# units, race day / time as sent, plus whether it has been saved to the P&L.
-# The desktop app owns the board and sends the whole list on every push, so this
-# page just shows it. Tips stay until the next Discord send.
-# ---------------------------------------------------------------------------
-import html as _html
-
-_DC_CSS = """<style>
-.dc-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:7px;font-size:10px;color:var(--t2);}
-.dc-ch{background:#1A2E4A;color:var(--acc);border-radius:20px;padding:2px 8px;font-weight:700;font-size:9px;letter-spacing:.3px;white-space:nowrap;}
-.dc-pnl{font-weight:700;white-space:nowrap;}
-.dc-note{font-size:10.5px;color:var(--t2);padding:2px 2px 10px;line-height:1.5;}
-</style>"""
-
-def _dc_sent_str(iso):
-    try: return datetime.datetime.fromisoformat(iso).strftime("%a %I:%M %p").replace(" 0", " ")
-    except Exception: return ""
-
-def _dc_day_prefix(t):
-    try:
-        d = datetime.date.fromisoformat(t.get("race_date", ""))
-        if d != datetime.datetime.now(NOTIFY_TZ).date():
-            return d.strftime("%a %d %b").upper() + " &middot; "
-    except Exception:
-        pass
-    return ""
-
-def _dc_foot(t):
-    res = str(t.get("result", "") or "").upper()
-    if res:
-        try: p = float(t.get("pnl_units") or 0)
-        except (TypeError, ValueError): p = 0.0
-        col = "var(--green)" if res == "WIN" else "var(--red)"
-        right = f'<span class="dc-pnl" style="color:{col};">{res} {p:+.2f}u</span>'
-    else:
-        right = '<span>Not in P&amp;L yet</span>'
-    ch = _html.escape(str(t.get("channel", "") or "Discord"))
-    return (f'<div class="dc-foot"><span><span class="dc-ch">{ch}</span>&nbsp; Sent {_dc_sent_str(t.get("sent_at", ""))}</span>'
-            f'{right}</div>')
-
-def _dc_f(v, default=0.0):
-    try: return float(v)
-    except (TypeError, ValueError): return default
-
-def _dc_single_card(t):
-    esc = _html.escape
-    typ = t.get("type", "BACK")
-    number = _get_horse_number(t)
-    horse = esc(f'{number}. {t.get("horse","")}' if number != "" else str(t.get("horse", "")))
-    tag_cls = "top-play" if typ == "BACK" else "secondary"
-    vp = _dc_f(t.get("value_pct"))
-    vc = "pos" if vp > 0 else "neg"
-    odds_label = "PLACE ODDS" if typ == "PLACE" else "ODDS"
-    return (
-        '<div class="card">'
-        f'<div class="ctop"><span class="horse-row">{_silk_html(_get_silk_url(t))}<span class="horse">{horse}</span></span>'
-        f'<span class="tag {tag_cls}">{esc(typ)}</span></div>'
-        f'<div class="meta">{_dc_day_prefix(t)}{esc(str(t.get("time","")))} &middot; {esc(str(t.get("track","")))} &middot; {esc(str(t.get("race","")))}</div>'
-        '<div class="stats">'
-        f'<div class="stat"><span class="sl">{odds_label}</span><span class="sv">${_dc_f(t.get("real_odds")):.2f}</span></div>'
-        f'<div class="stat"><span class="sl">UNITS</span><span class="sv">{_dc_f(t.get("units"), 1):g}u</span></div>'
-        f'<div class="stat"><span class="sl">VALUE</span><span class="sv {vc}">{vp:+.1f}%</span></div>'
-        f'<div class="stat"><span class="sl">RSI</span><span class="sv">{int(_dc_f(t.get("rsi")))}</span></div>'
-        f'<div class="stat"><span class="sl">WIN%</span><span class="sv">{_dc_f(t.get("win_pct")):.1f}%</span></div>'
-        '</div>'
-        f'{_dc_foot(t)}</div>'
-    )
-
-def _dc_multi_card(t):
-    legs = t.get("legs", []) or []
-    tracks = ", ".join(dict.fromkeys(l.get("track", "") for l in legs if l.get("track")))
-    title = f'{len(legs)}-Leg Multi' if legs else "Multi"
-    return (
-        '<div class="card multi-card">'
-        f'<div class="ctop"><span class="horse-row"><span class="horse">{title}</span></span><span class="tag watch">MULTI</span></div>'
-        f'<div class="meta">{_dc_day_prefix(t)}{_html.escape(tracks)}</div>'
-        f'<div class="multi-legs">{"".join(_multi_leg_html(l) for l in legs)}</div>'
-        '<div class="multi-foot">'
-        f'<div class="mf-item"><span class="sl">COMBINED ODDS</span><span class="sv">${_dc_f(t.get("combined_odds")):.2f}</span></div>'
-        f'<div class="mf-item"><span class="sl">UNITS</span><span class="sv">{_dc_f(t.get("units"), 1):g}u</span></div>'
-        '</div>'
-        f'{_dc_foot(t)}</div>'
-    )
-
-def _discord_body(store):
-    tips  = store.get("discord_tips") or []
-    back  = [t for t in tips if t.get("type") == "BACK"]
-    place = [t for t in tips if t.get("type") == "PLACE"]
-    multi = [t for t in tips if t.get("type") == "MULTI"]
-    if not tips:
-        return (_DC_CSS + '<div class="content"><p class="empty">Nothing sent to Discord yet.<br><br>'
-                'Tips you post from the app show up here exactly as posted (price, units, time) '
-                'and stay until you post new ones.</p></div>')
-    def section(items, label, sid, active):
-        inner = "".join(_dc_multi_card(t) if t.get("type") == "MULTI" else _dc_single_card(t) for t in items) \
-                or f'<p class="empty">No {label} tips sent</p>'
-        return f'<div class="section{" active" if active else ""}" id="{sid}" data-grp="dtips">{inner}</div>'
-    try:
-        upd = datetime.datetime.fromisoformat(store.get("discord_updated")).strftime("%a %d %b %H:%M")
-    except Exception:
-        upd = ""
-    return (
-        _DC_CSS +
-        '<div class="tabs">'
-        f'<button id="btn-db" class="tab active" data-tab="dtips" onclick="switchTab(\'db\',this,\'dtips\')">Back ({len(back)})</button>'
-        f'<button id="btn-dp" class="tab" data-tab="dtips" onclick="switchTab(\'dp\',this,\'dtips\')">Place ({len(place)})</button>'
-        f'<button id="btn-dm" class="tab" data-tab="dtips" onclick="switchTab(\'dm\',this,\'dtips\')">Multi ({len(multi)})</button>'
-        '</div>'
-        '<div class="content">'
-        f'<div class="dc-note">Exactly as posted to Discord{(" &middot; updated " + upd) if upd else ""}. These stay until new tips are posted.</div>'
-        + section(back, "back", "db", True) + section(place, "place", "dp", False) + section(multi, "multi", "dm", False) +
-        '</div>'
-        '<script>(function(){var p=new URLSearchParams(window.location.search).get("tab");'
-        'if(p){var b=document.getElementById("btn-"+p);if(b)b.click();}})();</script>'
-    )
-
-@app.get("/discord", response_class=HTMLResponse)
+# v10: the old Discord tab is now the Tips page itself, so these just redirect
+# (old bookmarks and home-screen links keep working).
+@app.get("/discord")
 async def discord_page():
-    await _refresh_store()
-    return HTMLResponse(_cached_page("discord:" + _today_str(), lambda: _shell("discord", _discord_body(_store), _store)))
+    return RedirectResponse(url="/tips")
 
-@app.get("/portal/discord", response_class=HTMLResponse)
+@app.get("/portal/discord")
 async def portal_discord_page():
-    await _refresh_store()
-    return HTMLResponse(_cached_page("portal_discord:" + _today_str(), lambda: _shell("discord", _discord_body(_store), _store, friend=True)))
+    return RedirectResponse(url="/portal/tips")
 
 @app.get("/api/discord")
 async def api_discord():
     await _refresh_store()
-    return JSONResponse({"updated": _store.get("discord_updated"), "tips": _store.get("discord_tips") or []})
+    return JSONResponse({"updated": _store.get("discord_updated"), "tips": _live_tips(_store)})
 
 @app.get("/", response_class=HTMLResponse)
 async def home_redirect():
-    # The Dashboard is the app's landing page — Tips lives at /tips now.
     return RedirectResponse(url="/dash")
 
 @app.get("/portal", response_class=HTMLResponse)
@@ -1942,25 +1866,25 @@ async def portal_home_redirect():
 @app.get("/tips", response_class=HTMLResponse)
 async def tips_page():
     await _refresh_store()
-    return HTMLResponse(_cached_page("tips", lambda: _shell("tips", _tips_body(_store), _store)))
+    return HTMLResponse(_cached_page("tips:" + _today_str(), lambda: _shell("tips", _tips_body(_store), _store)))
 
 @app.get("/portal/tips", response_class=HTMLResponse)
 async def portal_tips_page():
     await _refresh_store()
-    return HTMLResponse(_cached_page("portal_tips", lambda: _shell("tips", _tips_body(_store), _store, friend=True)))
+    return HTMLResponse(_cached_page("portal_tips:" + _today_str(), lambda: _shell("tips", _tips_body(_store), _store, friend=True)))
 
 def _dash_body(store, friend=False):
-    tips     = store["tips"]
+    tips     = _live_tips(store)
     analyzer = store["analyzer"]
-    back  = [t for t in tips if t["type"]=="BACK"]
-    place = [t for t in tips if t["type"]=="PLACE"]
-    multi = [t for t in tips if t["type"]=="MULTI"]
+    back  = [t for t in tips if t.get("type")=="BACK"]
+    place = [t for t in tips if t.get("type")=="PLACE"]
+    multi = [t for t in tips if t.get("type")=="MULTI"]
     all_t = back+place+multi
-    back_u   = sum(t.get("units",0) for t in back)
-    place_u  = sum(t.get("units",0) for t in place)
-    multi_u  = sum(t.get("units",0) for t in multi)
+    back_u   = sum(_dc_f(t.get("units")) for t in back)
+    place_u  = sum(_dc_f(t.get("units")) for t in place)
+    multi_u  = sum(_dc_f(t.get("units")) for t in multi)
     total_u  = back_u+place_u+multi_u
-    best     = max(all_t, key=lambda t: t.get("units",0), default=None)
+    best     = max(all_t, key=lambda t: _dc_f(t.get("units")), default=None)
 
     track_set = set()
     for t in all_t:
@@ -1969,16 +1893,14 @@ def _dash_body(store, friend=False):
                 if l.get("track"): track_set.add(l.get("track"))
         elif t.get("track"):
             track_set.add(t.get("track"))
-    tracks   = ", ".join(sorted(track_set)) or "—"
+    tracks   = ", ".join(sorted(track_set)) or "&mdash;"
     t_races  = len(analyzer)
     t_run    = sum(len(r.get("horses",[])) for r in analyzer)
     pushed   = _pushed_str(store)
 
     tips_base = "/portal/tips" if friend else "/tips"
 
-    # Bet-type boxes are now the only route into Tips — clicking one jumps
-    # straight to that tab. Each also shows its share of today's selections
-    # and gets a colour-matched top edge so the three read as a set.
+    # Bet-type boxes are the route into Tips - clicking one jumps straight to that tab.
     def _sc(tid, count, color, label):
         pct = round(100*count/len(all_t)) if all_t else 0
         return (
@@ -1989,8 +1911,7 @@ def _dash_body(store, friend=False):
             f'<div class="sc-pct">{pct}% of tips</div></div>'
         )
 
-    # Best Bet spotlight — whichever selection is carrying the most stake
-    # today, since that's the one the model is most confident in.
+    # Best Bet spotlight - whichever selection is carrying the most stake.
     spotlight_html = ""
     if best:
         b_type = best.get("type","")
@@ -2001,20 +1922,20 @@ def _dash_body(store, friend=False):
             title_name = f'{len(legs)}-Leg Multi'
             meta = f'{best.get("time","")} &middot; {leg_tracks}' if leg_tracks else best.get("time","")
             stats_html = (
-                f'<div class="spot-item"><span class="hsl">ODDS</span><span class="hsv">${best.get("combined_odds",0):.2f}</span></div>'
+                f'<div class="spot-item"><span class="hsl">ODDS</span><span class="hsv">${_dc_f(best.get("combined_odds")):.2f}</span></div>'
                 f'<div class="spot-item"><span class="hsl">LEGS</span><span class="hsv">{len(legs)}</span></div>'
-                f'<div class="spot-item"><span class="hsl">AVG RSI</span><span class="hsv">{int(best.get("avg_rsi",0))}</span></div>'
-                f'<div class="spot-item"><span class="hsl">UNITS</span><span class="hsv">{int(best.get("units",1))}u</span></div>'
+                f'<div class="spot-item"><span class="hsl">AVG RSI</span><span class="hsv">{int(_dc_f(best.get("avg_rsi")))}</span></div>'
+                f'<div class="spot-item"><span class="hsl">UNITS</span><span class="hsv">{_dc_f(best.get("units"), 1):g}u</span></div>'
             )
         else:
             title_name = best.get("horse","")
             meta = f'{best.get("time","")} &middot; {best.get("track","")} &middot; {best.get("race","")}'
             odds_lbl = "PLACE ODDS" if b_type == "PLACE" else "ODDS"
             stats_html = (
-                f'<div class="spot-item"><span class="hsl">{odds_lbl}</span><span class="hsv">${best.get("real_odds",0):.2f}</span></div>'
-                f'<div class="spot-item"><span class="hsl">VALUE</span><span class="hsv pos">{best.get("value_pct",0):+.1f}%</span></div>'
-                f'<div class="spot-item"><span class="hsl">RSI</span><span class="hsv">{int(best.get("rsi",0))}</span></div>'
-                f'<div class="spot-item"><span class="hsl">UNITS</span><span class="hsv">{int(best.get("units",1))}u</span></div>'
+                f'<div class="spot-item"><span class="hsl">{odds_lbl}</span><span class="hsv">${_dc_f(best.get("real_odds")):.2f}</span></div>'
+                f'<div class="spot-item"><span class="hsl">VALUE</span><span class="hsv pos">{_dc_f(best.get("value_pct")):+.1f}%</span></div>'
+                f'<div class="spot-item"><span class="hsl">RSI</span><span class="hsv">{int(_dc_f(best.get("rsi")))}</span></div>'
+                f'<div class="spot-item"><span class="hsl">UNITS</span><span class="hsv">{_dc_f(best.get("units"), 1):g}u</span></div>'
             )
         spotlight_html = (
             '<div class="card spotlight-card" style="margin-bottom:9px;">'
@@ -2028,8 +1949,7 @@ def _dash_body(store, friend=False):
             '</div>'
         )
 
-    # Units-by-type bar — quick visual read on where today's stake is
-    # concentrated, only shown once there's actually something staked.
+    # Units-by-type bar
     type_bar_html = ""
     if total_u > 0:
         back_pct  = round(100*back_u/total_u)
@@ -2051,12 +1971,8 @@ def _dash_body(store, friend=False):
             '</div>'
         )
 
-    # Next 5 races — every race is rendered as a hidden template row tagged
-    # with its raw time string. Client-side JS reads the viewer's own local
-    # clock (same approach as the Analyzer countdown), drops any race whose
-    # start time has already passed, and shows only the soonest 5 that are
-    # still upcoming. It re-checks every 30s so races roll off the list live
-    # as the day goes on, without needing the page to reload.
+    # Next 5 races - every race is rendered as a hidden template row; client-side
+    # JS drops races already started and shows the soonest 5, re-checking every 30s.
     all_sorted = sorted(analyzer, key=lambda r: _time_key(r.get("time","")))
     tmpl_rows = ""
     for r in all_sorted:
@@ -2130,7 +2046,7 @@ def _dash_body(store, friend=False):
         + f'<div class="card stat-card green" style="margin-bottom:9px;"><div class="stat-label">Races Loaded</div><div class="stat-value">{t_races}</div><div class="stat-sub">{t_run} runners</div></div>'
         + type_bar_html
         + next_html +
-        f'<div class="card" style="margin-bottom:9px;"><div class="stat-label" style="margin-bottom:8px;">Tracks Today</div><div style="font-size:13px;line-height:1.6;">{tracks}</div></div>'
+        f'<div class="card" style="margin-bottom:9px;"><div class="stat-label" style="margin-bottom:8px;">Tracks</div><div style="font-size:13px;line-height:1.6;">{tracks}</div></div>'
         f'<div class="card"><div class="stat-label" style="margin-bottom:8px;">Last Push</div><div style="font-size:14px;font-weight:600;">{pushed}</div><div style="font-size:11px;color:var(--t2);margin-top:3px;">Push #{store["push_count"]}</div></div>'
         '</div>'
     )
@@ -2259,22 +2175,16 @@ async def analyzer_page():
     return HTMLResponse(_cached_page("analyzer", lambda: _shell("analyzer", _analyzer_body(_store), _store)))
 
 # ---------------------------------------------------------------------------
-# Watch — live stream tab. Both sources are HLS (.m3u8) feeds, which can't
-# be dropped into an <iframe> like a normal web page, so each plays in a
-# native <video> element: Safari/iOS plays HLS natively, everything else
-# goes through hls.js (loaded from cdnjs). Both /watch and /portal/watch use
-# _watch_body(), so both get every stream listed here.
-#
-# "icon" is a two-letter badge shown next to the tab label (no actual logo
-# image is sourced or embedded here) — swap the background colour per
-# stream if you want them visually distinct.
+# Watch - live stream tab. Both sources are HLS (.m3u8) feeds, played in a
+# native <video> element: Safari/iOS plays HLS natively, everything else goes
+# through hls.js. "logo" is optional: when empty the tab shows the text label.
+# To bring back the Sky logo images, paste a data:image/png;base64,... URI
+# into each "logo" field below.
 # ---------------------------------------------------------------------------
 STREAM_SOURCES = [
-    {"id": "sky1", "label": "Sky 1",
-     "logo": "data:image/png;base64,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",
+    {"id": "sky1", "label": "Sky 1", "logo": "",
      "url": "https://skylivetab-new.akamaized.net/hls/live/2038780/sky1/index.m3u8"},
-    {"id": "sky2", "label": "Sky 2",
-     "logo": "data:image/png;base64,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",
+    {"id": "sky2", "label": "Sky 2", "logo": "",
      "url": "https://skylivetab-new.akamaized.net/hls/live/2038781/sky2/index.m3u8"},
 ]
 
@@ -2285,8 +2195,8 @@ def _watch_body():
         tabs_html = '<div class="tabs">' + "".join(
             f'<button class="tab{" active" if i==0 else ""}" data-tab="watch" '
             f'onclick="switchWatch(\'{s["id"]}\',this)">'
-            f'<img class="wtab-logo" src="{s["logo"]}" alt="{s["label"]}">'
-            f'</button>'
+            + (f'<img class="wtab-logo" src="{s["logo"]}" alt="{s["label"]}">' if s.get("logo") else s["label"])
+            + '</button>'
             for i, s in enumerate(STREAM_SOURCES)
         ) + '</div>'
     panes_html = "".join(
@@ -2371,10 +2281,7 @@ async def portal_watch_page():
     return HTMLResponse(_cached_page("portal_watch", lambda: _shell("watch", _watch_body(), _store, friend=True)))
 
 # ---------------------------------------------------------------------------
-# Today's P&L card (Dashboard, owner pages only). The desktop app sends just
-# the records dated the day each bet was marked WIN/LOSS. The card shows the
-# day's net units; tapping it expands the day's bets with units won/lost.
-# If the stored P&L is from an earlier day, it shows an empty day instead.
+# Today's P&L card (Dashboard, owner pages only).
 # ---------------------------------------------------------------------------
 
 def _today_str():
@@ -2441,15 +2348,13 @@ def _pnl_card(store):
     )
 
 # ---------------------------------------------------------------------------
-# Settings — jump-time push notifications. Subscriptions are per-device (the
-# browser's own push subscription), so this page talks to /api/push/* to
-# read/write settings for whichever device/browser has it open.
+# Settings - jump-time push notifications. Subscriptions are per-device.
 # ---------------------------------------------------------------------------
 
 def _settings_body():
     if not _PUSH_LIB_AVAILABLE:
         return ('<div class="content"><p class="empty">Push notifications need the <code>pywebpush</code> '
-                'package on the server — add it to requirements.txt and redeploy.</p></div>')
+                'package on the server - add it to requirements.txt and redeploy.</p></div>')
     if not (VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY):
         return ('<div class="content"><p class="empty">Push notifications aren\'t configured on '
                 'the server yet (missing VAPID keys).</p></div>')
@@ -2477,7 +2382,7 @@ def _settings_body():
 </div>
 <div class="card">
   <div style="font-size:11px;color:var(--t2);line-height:1.6;">
-    Back bets always notify when this is on. Notifications only ever go out on <b>Saturdays</b> &mdash; even if races happen to be loaded on another day.
+    Alerts cover the tips posted to Discord (Back always, Place and Multi if switched on) and only go out on the day of the race. On iPhone, add the app to your Home Screen first.
   </div>
 </div>
 </div>
