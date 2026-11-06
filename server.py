@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Post - Live Tips Server  v10 (Discord-only tips, hardened jump alerts, durable push subs, persistent storage via Upstash Redis, cached silk blobs)"""
+"""The Post - Live Tips Server  v11 (only the newest Discord board shows, past-day tips hidden, alerts only on the tip's own race day, persistent storage via Upstash Redis, cached silk blobs)"""
 
 import os, json, datetime, base64, hashlib, asyncio
 from collections import OrderedDict
@@ -39,6 +39,7 @@ NOTIFY_TYPES = ("BACK", "PLACE", "MULTI")
 # v10: days of the week alerts may go out (0=Mon ... 6=Sun). Default is every day,
 # so a bet on a Tuesday or Thursday can't be missed. Set the env var
 # NOTIFY_DAYS=5 on Render to go back to Saturday only.
+# v11: on top of this, a tip only ever alerts on its OWN race day.
 _nd = os.environ.get("NOTIFY_DAYS", "0,1,2,3,4,5,6")
 NOTIFY_DAYS = {int(x) for x in _nd.split(",") if x.strip().isdigit() and 0 <= int(x) <= 6} or set(range(7))
 # v10: an alert is still sent up to this many minutes AFTER the jump time if the
@@ -252,10 +253,21 @@ _store.setdefault("tips_updated", None)
 _push_lock = asyncio.Lock()
 
 def _live_tips(store):
-    """v10: the tips shown on the Tips page and Dashboard, returned by /api/tips
+    """The tips shown on the Tips page and Dashboard, returned by /api/tips
     and used for jump-time alerts are the tips posted to Discord, and nothing
-    else. They stay until the desktop app pushes a new, non-empty Discord board."""
-    return store.get("discord_tips") or []
+    else.
+
+    v11: a tip whose race day is in the past is never shown, so yesterday's
+    tips disappear at midnight (Melbourne) even if no new board has been sent
+    yet. Today's and future-dated tips (e.g. Saturday's board sent on Friday)
+    stay. A tip with no date at all is kept (it can still never alert)."""
+    today = _today_str()
+    out = []
+    for t in store.get("discord_tips") or []:
+        day = _tip_day(t, store)
+        if not day or day >= today:
+            out.append(t)
+    return out
 
 # ---------------------------------------------------------------------------
 # Durable push subscriptions. One Redis hash, one field per device.
@@ -381,7 +393,8 @@ def _register_all_silks():
 _register_all_silks()
 _subs_boot()
 
-# Rendered-HTML cache, keyed by page. Invalidated purely by push_count.
+# Rendered-HTML cache, keyed by page. Invalidated by push_count (and, because
+# every page key carries today's date, again at midnight Melbourne time).
 _page_cache = {}
 
 def _cached_page(key, build_fn):
@@ -421,14 +434,15 @@ def _sub_key(endpoint):
     return hashlib.sha1((endpoint or "").encode("utf-8")).hexdigest()[:16]
 
 def _tip_id(t):
+    day = _tip_day(t, _store)
     if t.get("type") == "MULTI":
         legs_key = "|".join(
             f'{l.get("track","")}-{l.get("race","")}-{l.get("horse","")}'
             for l in (t.get("legs") or [])
         )
-        raw = f'MULTI|{t.get("time","")}|{legs_key}'
+        raw = f'MULTI|{day}|{t.get("time","")}|{legs_key}'
     else:
-        raw = f'{t.get("type","")}|{t.get("track","")}|{t.get("race","")}|{t.get("time","")}|{t.get("horse","")}'
+        raw = f'{day}|{t.get("type","")}|{t.get("track","")}|{t.get("race","")}|{t.get("time","")}|{t.get("horse","")}'
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 def _jump_dt_today(time_str, now):
@@ -451,12 +465,38 @@ def _send_push_sync(subscription, payload):
     )
 
 def _tip_day(t, store):
-    """The date a tip is for (YYYY-MM-DD). Falls back to the day it was posted
-    to Discord; '' if the server has no date at all (treated as today)."""
+    """The date a tip is for (YYYY-MM-DD): the race day the desktop app sent
+    with it. Falls back to the day it was posted to Discord (Melbourne date);
+    '' if the server has no date at all."""
     rd = str(t.get("race_date") or "").strip()[:10]
     if not rd:
         rd = str(t.get("sent_at") or store.get("discord_updated") or "").strip()[:10]
     return rd
+
+def _incoming_day(t, today):
+    """Race day of a tip arriving in a new Discord push. A tip with no date at
+    all is treated as being for today."""
+    rd = str(t.get("race_date") or "").strip()[:10]
+    if not rd:
+        rd = str(t.get("sent_at") or "").strip()[:10]
+    return rd or today
+
+def _set_discord_board(new_discord, clear=False):
+    """v11: replace the Discord board wholesale, never merge it with the old
+    one. Tips dated before today are dropped from the incoming list. An empty
+    result only clears the board when clear=True (so a glitchy empty push can
+    never wipe good data). Returns True if the board changed."""
+    if not isinstance(new_discord, list):
+        return False
+    today = _today_str()
+    fresh = [t for t in new_discord if isinstance(t, dict) and _incoming_day(t, today) >= today]
+    if not fresh and not clear:
+        return False
+    if fresh == (_store.get("discord_tips") or []):
+        return False
+    _store["discord_tips"] = fresh
+    _store["discord_updated"] = datetime.datetime.now(NOTIFY_TZ).isoformat()
+    return True
 
 def _claim_send_sync(sub_key, tip_id):
     """True if this device has not been sent this tip yet. A Redis key (SET NX,
@@ -498,8 +538,8 @@ async def _notify_tick():
         if ttype not in NOTIFY_TYPES:
             continue
         day = _tip_day(t, _store)
-        if day and day != today:
-            continue   # a tip for another day must never alert today
+        if day != today:
+            continue   # v11: alerts only on the tip's own race day (unknown day = no alert)
         jump = _jump_dt_today(t.get("time", ""), now)
         if not jump:
             continue
@@ -650,6 +690,7 @@ async def push(request: Request, x_api_key: str = Header(default="")):
         new_pnl      = body.get("pnl")
         tips_commit  = bool(body.get("tips_commit", True))
         new_discord  = body.get("discord_tips")   # None = not sent, list = the whole Discord board
+        discord_clear = bool(body.get("discord_clear", False))   # v11: explicit wipe of the board
         # Refuse an entirely empty payload if we're already holding real data.
         is_suspicious_empty = (
             not new_analyzer and (not tips_commit or not new_tips)
@@ -660,10 +701,8 @@ async def push(request: Request, x_api_key: str = Header(default="")):
             if isinstance(new_pnl, dict) and new_pnl != _store.get("pnl"):
                 _store["pnl"] = new_pnl
                 changed = True
-            # v10: an empty Discord list never clears the board
-            if isinstance(new_discord, list) and new_discord and new_discord != _store.get("discord_tips"):
-                _store["discord_tips"] = new_discord
-                _store["discord_updated"] = datetime.datetime.now().isoformat()
+            # v11: the board is replaced (never merged); an empty list only clears it with discord_clear
+            if _set_discord_board(new_discord, discord_clear):
                 changed = True
             if changed:
                 _store["push_count"] += 1
@@ -677,10 +716,7 @@ async def push(request: Request, x_api_key: str = Header(default="")):
         if tips_commit:
             _store["tips"]         = new_tips
             _store["tips_updated"] = body.get("generated_at") or datetime.datetime.now().isoformat()
-        if isinstance(new_discord, list) and new_discord:   # v10: an empty list never clears the board
-            if new_discord != _store.get("discord_tips"):
-                _store["discord_updated"] = datetime.datetime.now().isoformat()
-            _store["discord_tips"] = new_discord
+        _set_discord_board(new_discord, discord_clear)   # v11: replaces the board, drops past-dated tips
         _store["analyzer"]    = new_analyzer
         _store["live"]        = new_live
         if isinstance(new_pnl, dict):
@@ -690,7 +726,7 @@ async def push(request: Request, x_api_key: str = Header(default="")):
         _register_all_silks()
         await run_in_threadpool(_save, _store)
     return {"status":"ok","tips":len(_live_tips(_store)),"analyzer_races":len(_store["analyzer"]),"live_races":len(_store["live"]),
-            "tips_committed":tips_commit,"discord_tips":len(_store.get("discord_tips") or [])}
+            "tips_committed":tips_commit,"discord_tips":len(_live_tips(_store))}
 
 @app.get("/api/tips")
 async def api_tips():
@@ -731,7 +767,7 @@ async def push_status_api():
             "type": t.get("type"),
             "time": t.get("time", ""),
             "race_day": day or "unknown",
-            "alerts_today": bool((not day or day == today) and jump is not None),
+            "alerts_today": bool(day == today and jump is not None),
             "minutes_to_jump": round((jump - now).total_seconds() / 60.0) if jump else None,
         })
     return {
@@ -2059,7 +2095,7 @@ async def dash_page():
 @app.get("/portal/dash", response_class=HTMLResponse)
 async def portal_dash_page():
     await _refresh_store()
-    return HTMLResponse(_cached_page("portal_dash", lambda: _shell("dash", _dash_body(_store, friend=True), _store, friend=True)))
+    return HTMLResponse(_cached_page("portal_dash:" + _today_str(), lambda: _shell("dash", _dash_body(_store, friend=True), _store, friend=True)))
 
 def _analyzer_body(store):
     races = sorted(store["analyzer"], key=lambda r: _time_key(r.get("time","")))
@@ -2172,7 +2208,7 @@ setInterval(_tickCountdowns, 15000);
 @app.get("/analyzer", response_class=HTMLResponse)
 async def analyzer_page():
     await _refresh_store()
-    return HTMLResponse(_cached_page("analyzer", lambda: _shell("analyzer", _analyzer_body(_store), _store)))
+    return HTMLResponse(_cached_page("analyzer:" + _today_str(), lambda: _shell("analyzer", _analyzer_body(_store), _store)))
 
 # ---------------------------------------------------------------------------
 # Watch - live stream tab. Both sources are HLS (.m3u8) feeds, played in a
@@ -2273,12 +2309,12 @@ function switchWatch(id,btn){{
 @app.get("/watch", response_class=HTMLResponse)
 async def watch_page():
     await _refresh_store()
-    return HTMLResponse(_cached_page("watch", lambda: _shell("watch", _watch_body(), _store)))
+    return HTMLResponse(_cached_page("watch:" + _today_str(), lambda: _shell("watch", _watch_body(), _store)))
 
 @app.get("/portal/watch", response_class=HTMLResponse)
 async def portal_watch_page():
     await _refresh_store()
-    return HTMLResponse(_cached_page("portal_watch", lambda: _shell("watch", _watch_body(), _store, friend=True)))
+    return HTMLResponse(_cached_page("portal_watch:" + _today_str(), lambda: _shell("watch", _watch_body(), _store, friend=True)))
 
 # ---------------------------------------------------------------------------
 # Today's P&L card (Dashboard, owner pages only).
@@ -2501,7 +2537,7 @@ window.addEventListener('load', function(){{ loadPushSettings(); }});
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page():
     await _refresh_store()
-    return HTMLResponse(_cached_page("settings", lambda: _shell("settings", _settings_body(), _store)))
+    return HTMLResponse(_cached_page("settings:" + _today_str(), lambda: _shell("settings", _settings_body(), _store)))
 
 if __name__ == "__main__":
     import uvicorn
