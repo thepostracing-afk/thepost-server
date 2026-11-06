@@ -1045,6 +1045,11 @@ self.addEventListener('pushsubscriptionchange', function(event){
 _HEAL_JS = r"""(function(){
   var VAPID = "__VAPID__";
   var FLAG = 'thepost_push_on', PK = 'thepost_push_prefs';
+  function mark(on){
+    try { localStorage.setItem(FLAG, on ? '1' : '0'); } catch(e) {}
+    try { document.cookie = 'thepost_push_on=' + (on ? '1' : '0') + '; max-age=31536000; path=/; SameSite=Lax'; } catch(e) {}
+  }
+  window.thePostPushMark = mark;
   function b64(b){
     var pad = '='.repeat((4 - b.length % 4) % 4);
     var base64 = (b + pad).replace(/-/g, '+').replace(/_/g, '/');
@@ -1061,6 +1066,8 @@ _HEAL_JS = r"""(function(){
       if (Notification.permission !== 'granted') return;
       var want = false;
       try { want = localStorage.getItem(FLAG) === '1'; } catch(e) {}
+      if (!want) { want = /(?:^|; )thepost_push_on=1/.test(document.cookie); }
+      try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch(e) {}
       var reg = await navigator.serviceWorker.getRegistration('/sw.js');
       if (!reg) {
         if (!want) return;
@@ -1084,11 +1091,11 @@ _HEAL_JS = r"""(function(){
         try { await sub.unsubscribe(); } catch(e) {}
         sub = await reg.pushManager.subscribe({userVisibleOnly: true, applicationServerKey: b64(VAPID)});
       } else if (s.subscribed) {
-        try { localStorage.setItem(FLAG, '1'); } catch(e) {}
+        mark(true);
         return;
       }
       var res = await post('/api/push/subscribe', {subscription: sub.toJSON(), prefs: prefs, resync: true, replaces: replaces});
-      if (res.ok) { try { localStorage.setItem(FLAG, '1'); } catch(e) {} }
+      if (res.ok) { mark(true); }
     } catch(e) {}
   }
   var inflight = null;
@@ -1097,13 +1104,11 @@ _HEAL_JS = r"""(function(){
     return inflight;
   };
   window.thePostPushHeal();
-  var last = Date.now();
   document.addEventListener('visibilitychange', function(){
-    if (document.visibilityState === 'visible' && Date.now() - last > 600000) {
-      last = Date.now();
-      window.thePostPushHeal();
-    }
+    if (document.visibilityState === 'visible') window.thePostPushHeal();
   });
+  window.addEventListener('pageshow', function(){ window.thePostPushHeal(); });
+  window.addEventListener('focus', function(){ window.thePostPushHeal(); });
 })();
 """.replace("__VAPID__", "%VAPID%")
 
@@ -2564,7 +2569,7 @@ async function enablePush(){{
     }}
     var sr=await fetch('/api/push/subscribe',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{subscription:sub.toJSON(),prefs:_currentPrefs()}})}});
     if(!sr.ok) throw new Error('subscribe failed');
-    try{{ localStorage.setItem('thepost_push_on','1'); localStorage.setItem('thepost_push_prefs',JSON.stringify(_currentPrefs())); }}catch(e){{}}
+    try{{ if(window.thePostPushMark) window.thePostPushMark(true); localStorage.setItem('thepost_push_prefs',JSON.stringify(_currentPrefs())); }}catch(e){{}}
     _setStatus('Enabled on this device.');
   }}catch(e){{
     document.getElementById('pref-enabled').checked=false;
@@ -2574,7 +2579,7 @@ async function enablePush(){{
 async function disablePush(){{
   try{{
     var sub=await _getSub();
-    try{{ localStorage.setItem('thepost_push_on','0'); }}catch(e){{}}
+    try{{ if(window.thePostPushMark) window.thePostPushMark(false); }}catch(e){{}}
     if(sub){{
       var ur=await fetch('/api/push/unsubscribe',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{endpoint:sub.endpoint}})}});
       if(!ur.ok) throw new Error('server unsubscribe failed');
