@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Post - Live Tips Server  v11 (only the newest Discord board shows, past-day tips hidden, alerts only on the tip's own race day, persistent storage via Upstash Redis, cached silk blobs)"""
+"""The Post - Live Tips Server  v12 (phone widget feeds, only the newest Discord board shows, past-day tips hidden, alerts only on the tip's own race day, persistent storage via Upstash Redis, cached silk blobs)"""
 
 import os, json, datetime, base64, hashlib, asyncio
 from collections import OrderedDict
@@ -742,6 +742,76 @@ async def api_analyzer():
 async def api_status():
     await _refresh_store()
     return {"last_push":_store["last_push"],"push_count":_store["push_count"],"tips":len(_live_tips(_store)),"analyzer_races":len(_store["analyzer"])}
+
+# ---------------------------------------------------------------------------
+# v12: phone widget feeds (read by the Scriptable widgets on iPhone, or any
+# widget app that can load JSON). Small, no-cache, same data as the app.
+# ---------------------------------------------------------------------------
+def _widget_tip_row(t, now):
+    ttype = t.get("type", "")
+    if ttype == "MULTI":
+        legs = t.get("legs") or []
+        first = legs[0] if legs else {}
+        horse = f'{len(legs)}-Leg Multi' if legs else "Multi"
+        track = ", ".join(dict.fromkeys(l.get("track", "") for l in legs if l.get("track")))
+        time_s = first.get("time", t.get("time", ""))
+        price = t.get("combined_odds")
+        number = ""
+    else:
+        horse = t.get("horse", "")
+        track = t.get("track", "")
+        time_s = t.get("time", "")
+        price = t.get("real_odds")
+        number = _get_horse_number(t)
+    jump = _jump_dt_today(time_s, now)
+    return {
+        "type": ttype,
+        "number": number,
+        "horse": horse,
+        "track": track,
+        "race": t.get("race", "") if ttype != "MULTI" else "Multi",
+        "time": time_s,
+        "odds": round(_dc_f(price), 2),
+        "units": _dc_f(t.get("units"), 1),
+        "minutes": round((jump - now).total_seconds() / 60.0) if jump else None,
+    }
+
+@app.get("/api/widget/tips")
+async def api_widget_tips():
+    """Today's tips only (race day = today, Melbourne), earliest jump first."""
+    await _refresh_store()
+    now = datetime.datetime.now(NOTIFY_TZ)
+    today = now.date().isoformat()
+    rows = []
+    for t in _live_tips(_store):
+        if t.get("type") not in NOTIFY_TYPES:
+            continue
+        if _tip_day(t, _store) != today:
+            continue
+        rows.append(_widget_tip_row(t, now))
+    rows.sort(key=lambda r: _time_key(r["time"]))
+    return JSONResponse({"date": today, "count": len(rows), "tips": rows},
+                        headers={"Cache-Control": "no-store"})
+
+@app.get("/api/widget/races")
+async def api_widget_races(n: int = 5):
+    """The next n races that have not started yet (default 5)."""
+    await _refresh_store()
+    now = datetime.datetime.now(NOTIFY_TZ)
+    rows = []
+    for r in _store.get("analyzer", []):
+        jump = _jump_dt_today(r.get("time", ""), now)
+        if not jump:
+            continue
+        mins = (jump - now).total_seconds() / 60.0
+        if mins <= 0:
+            continue
+        rows.append({"time": r.get("time", ""), "track": r.get("track", ""),
+                     "race": r.get("race", ""), "minutes": round(mins)})
+    rows.sort(key=lambda r: r["minutes"])
+    n = max(1, min(int(n), 10))
+    return JSONResponse({"date": now.date().isoformat(), "races": rows[:n]},
+                        headers={"Cache-Control": "no-store"})
 
 @app.get("/healthz")
 async def healthz():
